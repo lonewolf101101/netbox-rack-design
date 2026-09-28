@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Annotated
 import strawberry
 import strawberry_django
 from netbox.graphql.types import NetBoxObjectType
+from strawberry.types import Info
 
 from ..models import Design, DesignGroup, DesignPlacement, DesignPowerFeed
 from .filters import (
@@ -55,9 +56,22 @@ class DesignType(NetBoxObjectType):
     # ``children`` is a reverse-relation property (Design.children), not a
     # Django field, so ``fields="__all__"`` never picks it up -- it needs an
     # explicit resolver like every other non-field attribute on this type.
+    #
+    # Restricted by view permission (``info.context.request.user``, the same
+    # object strawberry_django's own automatic queryset restriction reads):
+    # ``Design.children`` returns a QUERYSET (``derived_designs.all()``), so
+    # ``.restrict()`` chains onto it directly, the same call REST's
+    # ``DesignSerializer``/``api/views.py`` use throughout. Returning a plain
+    # Python ``list()`` (as this used to) is what let a hidden child slip
+    # through in the first place: strawberry_django's automatic per-type
+    # restriction only ever applies to a QuerySet return, so a list built from
+    # one -- even though every element started out restricted-eligible --
+    # bypasses it entirely, fully exposing a design the caller has no
+    # ``view_design`` grant for (title, comments, description, custom fields)
+    # merely because it is a child of one they can see.
     @strawberry_django.field
-    def children(self) -> list[Annotated["DesignType", strawberry.lazy("netbox_rack_design.graphql.types")]]:
-        return list(self.children)
+    def children(self, info: Info) -> list[Annotated["DesignType", strawberry.lazy("netbox_rack_design.graphql.types")]]:
+        return list(self.children.restrict(info.context.request.user, "view"))
 
     # ``is_frozen`` (Design.is_frozen) is a plain bool property.
     @strawberry_django.field
@@ -65,7 +79,7 @@ class DesignType(NetBoxObjectType):
         return self.is_frozen
 
     @strawberry_django.field
-    def ancestors(self) -> list[Annotated["DesignType", strawberry.lazy("netbox_rack_design.graphql.types")]]:
+    def ancestors(self, info: Info) -> list[Annotated["DesignType", strawberry.lazy("netbox_rack_design.graphql.types")]]:
         """
         The ordered ``based_on`` chain (oldest first), i.e.
         ``Design.baseline_chain()`` surfaced over GraphQL.
@@ -79,11 +93,24 @@ class DesignType(NetBoxObjectType):
         distinguish "no parent" from "broken lineage" already has
         ``based_on`` for that -- a non-null ``based_on`` with empty
         ``ancestors`` says exactly that.
+
+        Unlike ``children`` above, ``baseline_chain()`` walks raw FKs and
+        returns a plain list, not a queryset -- there is nothing to
+        ``.restrict()`` it with. Filtered here against a single bulk
+        permission check instead, dropping any ancestor the caller has no
+        ``view_design`` grant for, rather than exposing its full content the
+        same way an unrestricted ``children`` list used to.
         """
         try:
-            return self.baseline_chain()
+            chain = self.baseline_chain()
         except ValueError:
             return []
+        visible_ids = set(
+            Design.objects.restrict(info.context.request.user, "view")
+            .filter(pk__in=[d.pk for d in chain])
+            .values_list("pk", flat=True)
+        )
+        return [d for d in chain if d.pk in visible_ids]
 
 
 # A PLANNED power feed. Now a queryable object in its own right (it became a

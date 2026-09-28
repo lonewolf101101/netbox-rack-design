@@ -118,6 +118,7 @@ from dcim.models import Device
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 from netbox.plugins import get_plugin_config
+from utilities.exceptions import PermissionsViolation
 
 from . import projection
 from .choices import DesignPlacementKindChoices, DesignStatusChoices
@@ -409,6 +410,22 @@ def plan(design, user):
                 f"{_placement_label(pl)} is a blade placement; blade placements "
                 f"cannot be applied yet."
             )
+        elif (
+            pl.kind == DesignPlacementKindChoices.KIND_MOVE
+            and pl.device_id is None
+        ):
+            # A chain "move" whose identity is an ancestor's planned add
+            # (base_placement set, device intentionally None -- see
+            # DesignPlacement's own field comment). Nothing ever fills in
+            # `device` for this row: it is not a race with the ancestor's
+            # apply, it is a kind this version of apply cannot execute yet,
+            # so it must be reported like any other unworkable placement
+            # rather than reaching _target_name()/device_type resolution
+            # below, both of which assume pl.device is set for a move.
+            result.problems.append(
+                f"{_placement_label(pl)} moves a device that an ancestor design "
+                f"has not created yet; apply the ancestor first."
+            )
         else:
             workable.append(pl)
 
@@ -612,19 +629,45 @@ def _execute(design, user, result):
 
     for entry in result.updated:
         device = entry.device
+        # Snapshot before mutating a PRE-EXISTING device, matching the
+        # pattern signals.py already uses for placements: without it, this
+        # device's changelog entry would record the new state with no
+        # prechange_data to compare it against.
+        device.snapshot()
         for attr, value in entry.changes.items():
             setattr(device, attr, value)
         device.full_clean()
         device.save()
+        # plan()'s own permission check (above) only verified this device
+        # against the user's restrict(user, "change") queryset BEFORE any
+        # attribute was changed. NetBox's own ObjectEditView/BulkEditView
+        # re-validate an object against the SAME restricted queryset AFTER
+        # save, specifically to catch a write that moves the object outside
+        # what the user may modify (e.g. a tenant-constrained user retargeting
+        # a device's tenant via the placement they're allowed to edit).
+        # Raising here rolls back the whole run() -- it is wrapped in
+        # transaction.atomic() -- rather than leaving a partially-applied
+        # design.
+        if not Device.objects.restrict(user, "change").filter(pk=device.pk).exists():
+            raise PermissionsViolation(
+                f"You do not have permission to modify device {device.name} "
+                f"as changed."
+            )
         row = entry.apply_row
         row.applied_by = user
         row.save()
 
     for entry in result.removed:
         device = entry.device
+        device.snapshot()
         device.status = removal_status
         device.full_clean()
         device.save()
+        if not Device.objects.restrict(user, "change").filter(pk=device.pk).exists():
+            raise PermissionsViolation(
+                f"You do not have permission to modify device {device.name} "
+                f"as changed."
+            )
         if entry.corrected:
             row = entry.apply_row
             # prior_device_status is left untouched: it must keep recording the
@@ -647,8 +690,14 @@ def _execute(design, user, result):
     for entry in result.reverted:
         device = entry.device
         if device is not None:
+            device.snapshot()
             device.status = entry.prior_status
             device.full_clean()
             device.save()
+            if not Device.objects.restrict(user, "change").filter(pk=device.pk).exists():
+                raise PermissionsViolation(
+                    f"You do not have permission to modify device {device.name} "
+                    f"as changed."
+                )
         entry.apply_row.delete()
         entry.device = None

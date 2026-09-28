@@ -205,8 +205,17 @@ def _placement_custom_fields(placement):
     source_device = getattr(placement, "power_source_device", None)
     if source_device is not None:
         return dict(source_device.cf or {})
-    config = getattr(placement, "power_config", None) or {}
-    return dict(config.get("custom_fields") or {})
+    config = getattr(placement, "power_config", None)
+    # Defensive: power_config is stored as-is (models.py validates its SHAPE
+    # on write today, but a row written before that validation existed, or by
+    # a direct script write that skipped full_clean(), can still hold a
+    # non-dict value). A bare `config.get(...)` on such a value -- a JSON
+    # list, say -- raises AttributeError, breaking every projection of the
+    # rack for every subsequent viewer.
+    if not isinstance(config, dict):
+        return {}
+    custom_fields = config.get("custom_fields")
+    return dict(custom_fields) if isinstance(custom_fields, dict) else {}
 
 
 def devices_from_elevation(elevation):
@@ -903,9 +912,30 @@ def generate_distribution_status(elevation, *, mode=None):
     # all, so this override -- which exists purely to feed a script -- is only
     # applied in "script" mode; "none" mode never reaches here either, so it
     # never queries DesignRackPower.
-    if mode == "script":
-        apply_rack_power_override(elevation)
-    devices = devices_from_elevation(elevation)
+    # Pre-processing shared by both engines below. Wrapped the same as each
+    # engine's own call further down: an unexpected exception here (e.g. a
+    # deployment's DesignRackPower row somehow holding a value that survives
+    # clean()'s shape check but still trips something in the merge) must
+    # degrade the SAME way an engine failure does, not bypass the "always
+    # degrades gracefully" contract this function documents by crashing one
+    # step earlier than the try/except blocks that were written to catch it.
+    try:
+        if mode == "script":
+            apply_rack_power_override(elevation)
+        devices = devices_from_elevation(elevation)
+    except Exception as exc:  # noqa: BLE001 - must never break the editor
+        logger.warning(
+            "distribution_mode %r raised unexpectedly while preparing rack %r; "
+            "falling back to no per-bank distribution (per-device heatmap).",
+            mode, getattr(elevation.rack, "name", None), exc_info=True,
+        )
+        script_path = (
+            get_plugin_config(PLUGIN_NAME, "distribution_script", "") if mode == "script" else None
+        )
+        return None, {
+            "state": "failed", "engine": mode, "script": script_path or None,
+            "detail": f"Preparing the rack for distribution raised {_exc_line(exc)}",
+        }
     planned_pdu_count = sum(
         1 for d in devices
         if d.get("device") is None and (d.get("role") or "") in ("pdu", "unmanageable-pdu")

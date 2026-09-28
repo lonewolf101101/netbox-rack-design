@@ -10,8 +10,10 @@ against the plugin's actual snake_case query names through the unified
 
 import json
 
+from core.models import ObjectType
 from django.test import override_settings
 from django.urls import reverse
+from users.models import ObjectPermission
 from utilities.testing import APITestCase
 
 from ..choices import DesignPlacementKindChoices, DesignStatusChoices
@@ -258,3 +260,63 @@ class DesignChainGraphQLTestCase(APITestCase):
         self.assertIsNone(placement_data["base_parent_placement"])
         self.assertFalse(placement_data["stale"])
         self.assertEqual(placement_data["stale_device_name"], "")
+
+    def _restrict_to(self, *designs):
+        """Constrain self.user's view_design grant to exactly these designs."""
+        permission = ObjectPermission(
+            name=f"graphql-restricted-{'-'.join(str(d.pk) for d in designs)}",
+            actions=["view"],
+            constraints={"pk__in": [d.pk for d in designs]},
+        )
+        permission.save()
+        permission.users.add(self.user)
+        permission.object_types.add(ObjectType.objects.get_for_model(Design))
+
+    @override_settings(LOGIN_REQUIRED=True)
+    def test_ancestors_omit_a_design_the_caller_cannot_view(self):
+        """
+        Regression test: ``ancestors`` used to return
+        ``Design.baseline_chain()`` -- a plain Python list from a raw FK walk
+        -- directly, so strawberry_django's automatic per-type view-permission
+        restriction (which only ever applies to a QuerySet return) never ran.
+        A hidden ancestor was fully exposed (title, version, status, and any
+        other scalar field a client asks for) just by sharing a chain with a
+        design the caller can see.
+        """
+        self._restrict_to(self.design_b, self.design_c)  # design_a stays hidden
+        query = f"""
+        query {{
+            design(id: {self.design_c.pk}) {{
+                ancestors {{ id title }}
+            }}
+        }}
+        """
+        response = self._query(query)
+        self.assertHttpStatus(response, 200)
+        data = json.loads(response.content)
+        self.assertNotIn("errors", data)
+        ancestors = data["data"]["design"]["ancestors"]
+        ancestor_ids = [a["id"] for a in ancestors]
+        self.assertNotIn(str(self.design_a.pk), ancestor_ids)
+        self.assertNotIn("A", [a["title"] for a in ancestors])
+
+    @override_settings(LOGIN_REQUIRED=True)
+    def test_children_omit_a_design_the_caller_cannot_view(self):
+        hidden_child = Design.objects.create(
+            title="Hidden sibling of B", site=self.site, based_on=self.design_a,
+        )
+        self._restrict_to(self.design_a, self.design_b)  # hidden_child excluded
+        query = f"""
+        query {{
+            design(id: {self.design_a.pk}) {{
+                children {{ id title }}
+            }}
+        }}
+        """
+        response = self._query(query)
+        self.assertHttpStatus(response, 200)
+        data = json.loads(response.content)
+        self.assertNotIn("errors", data)
+        children = data["data"]["design"]["children"]
+        self.assertEqual([c["title"] for c in children], ["B"])
+        self.assertNotIn(str(hidden_child.pk), [c["id"] for c in children])

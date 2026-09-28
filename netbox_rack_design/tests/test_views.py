@@ -10,7 +10,7 @@ from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from users.models import ObjectPermission, User
-from utilities.testing import TestCase, ViewTestCases, create_tags
+from utilities.testing import TestCase, ViewTestCases, create_tags, create_test_device
 
 from .. import views
 from ..choices import DesignPlacementKindChoices, DesignStatusChoices
@@ -859,6 +859,34 @@ class ElevationBrowserViewTest(TestCase):
         self.assertHttpStatus(response, 200)
         rack_pks = set(response.context["form"].fields["rack"].queryset.values_list("pk", flat=True))
         self.assertEqual(rack_pks, {self.rack1.pk, self.rack2.pk})
+
+    def test_object_level_view_design_constraint_hides_other_designs_rows(self):
+        """
+        Regression test: ``ContentTypePermissionRequiredMixin`` only enforces
+        the MODEL-level ``view_design`` permission -- it "does not enforce
+        object-level permissions" (NetBox core). Without ``_build_rows``
+        filtering by ``Design.objects.restrict(user, "view")`` itself, a
+        ``view_design`` grant object-constrained to design1 still listed
+        design2's rows too.
+        """
+        restricted = User.objects.create_user(username="elevation-restricted")
+        permission = ObjectPermission(
+            name="elevation-restricted", actions=["view"],
+            constraints={"pk": self.design1.pk},
+        )
+        permission.save()
+        permission.users.add(restricted)
+        permission.object_types.add(ObjectType.objects.get_for_model(Design))
+
+        client = self.client_class()
+        client.force_login(restricted)
+        response = client.get(self._url)
+        self.assertHttpStatus(response, 200)
+        content = response.content.decode()
+        self.assertIn(self._elevation_url(self.design1, self.rack1), content)
+        self.assertNotIn(self._elevation_url(self.design2, self.rack1), content)
+        self.assertNotIn(self._elevation_url(self.design2, self.rack2), content)
+        self.assertNotIn(self.design2.title, content)
 
 
 class DesignEditorViewTest(TestCase):
@@ -2620,6 +2648,45 @@ class DesignEditorPeerConflictContextTest(TestCase):
         response = self.client.get(self._editor_url(self.plain_design()))
         self.assertHttpStatus(response, 200)
         self.assertNotContains(response, "nbx-rd-peer-conflicts")
+
+    def test_peer_device_claim_detail_omits_the_peers_destination(self):
+        """
+        Regression test: ``peer_device_claim``'s detail used to name the
+        PEER'S OWN destination rack and unit -- a field of the hidden peer
+        design's placement beyond what docs/peer-conflicts.md documents as
+        disclosed (its title). It must still identify the contested device
+        and the peer design, just not where the peer is sending it.
+        """
+        contested = create_test_device(
+            "Peer contested device", site=self.site, rack=self.rack,
+            position=5, face="front",
+        )
+        DesignPlacement.objects.create(
+            design=self.child, kind=DesignPlacementKindChoices.KIND_MOVE,
+            device=contested, target_rack=self.rack,
+            target_position=6, target_face="front",
+        )
+        peer_destination_rack_name = "Peer-only destination rack"
+        peer_rack = Rack.objects.create(name=peer_destination_rack_name, site=self.site)
+        self.peer.racks.add(peer_rack)
+        DesignPlacement.objects.create(
+            design=self.peer, kind=DesignPlacementKindChoices.KIND_MOVE,
+            device=contested, target_rack=peer_rack,
+            target_position=8, target_face="front",
+        )
+
+        response = self.client.get(self._editor_url(self.child))
+        self.assertHttpStatus(response, 200)
+        device_claims = [
+            e for e in response.context["peer_conflicts"]
+            if e["kind"] == "peer_device_claim"
+        ]
+        self.assertEqual(len(device_claims), 1, device_claims)
+        detail = device_claims[0]["detail"]
+        self.assertIn(str(self.peer), detail)
+        self.assertIn(contested.name, detail)
+        self.assertNotIn(peer_destination_rack_name, detail)
+        self.assertNotIn("U8", detail)
 
     # --- P12 grouping: only worth collapsing when there is a batch ---------
 

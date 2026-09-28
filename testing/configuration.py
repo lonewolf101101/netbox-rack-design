@@ -132,7 +132,22 @@ MEDIA_ROOT = '/tmp/netbox_media'
 SESSION_COOKIE_SECURE = False
 CSRF_COOKIE_SECURE = False
 
-# Email configuration (for testing only)
+# Email configuration (for testing only). NetBox 4.7+ reads a single EMAIL dict
+# (feeding Django 6.1's native MAILERS setting) and no longer consults the
+# discrete EMAIL_* names below; NetBox 4.4-4.6 read only the discrete names and
+# ignore this dict. Both forms are set so this one file works across the whole
+# supported range with no version check -- each version reads what it needs and
+# silently ignores the other.
+EMAIL = {
+    'SERVER': 'localhost',
+    'PORT': 25,
+    'USERNAME': '',
+    'PASSWORD': '',
+    'USE_SSL': False,
+    'USE_TLS': False,
+    'TIMEOUT': 10,
+    'FROM_EMAIL': 'netbox@localhost',
+}
 EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 EMAIL_SERVER = 'localhost'
 EMAIL_PORT = 25

@@ -1257,6 +1257,16 @@ def _reservation_of(device, applies_by_device_id, design):
     apply_row = applies_by_device_id.get(device.pk) if applies_by_device_id else None
     if apply_row is None or apply_row.design_id == (design.pk if design else None):
         return None, ""
+    # Naming the OTHER design here is the same disclosure the peer-conflict
+    # feature makes deliberately (docs/peer-conflicts.md) -- another design's
+    # title, shown to a viewer who may have no view_design permission on it
+    # at all -- but this path never checked the killswitch that is supposed
+    # to turn that off. Gated only here, on the label, not on the
+    # applies_by_device_id lookup itself: that map also drives this design's
+    # OWN "applied" marking and duplicate suppression above, which must keep
+    # working with peer_conflicts_enabled False.
+    if not _peer_conflicts_enabled():
+        return None, ""
     return apply_row.design_id, apply_row.design_title
 
 
@@ -2733,13 +2743,21 @@ def _peer_conflicts(design, rack, own_placements, front, rear):
                         slot["peer_design_id"] = peer.design_id
                         slot["peer_design_title"] = str(peer.design)
         if hit is not None:
+            # Reports OUR OWN contested unit (hit["u_position"]), not the
+            # peer's target_position: a peer device can span multiple units,
+            # only some of which overlap ours, and a unit that's the peer's
+            # alone (not something this design's plan even touches) is a
+            # field of the hidden peer design's placement beyond what
+            # docs/peer-conflicts.md documents as disclosed (its title). The
+            # rack itself is fine to name -- it's the one the reader is
+            # already looking at.
             conflicts.append(_conflict(
                 "peer_slot_claim",
                 severity=_peer_severity(peer.design),
                 slot=hit,
                 source_design=peer.design,
                 detail=f"{peer.design} also plans a device at "
-                       f"U{_fmt_u(peer.target_position)} in {rack}.",
+                       f"U{_fmt_u(hit['u_position'])} in {rack}.",
             ))
 
     # --- peer_name_claim: a peer placement's effective name equals one of
@@ -2773,20 +2791,19 @@ def _peer_conflicts(design, rack, own_placements, front, rear):
         peer = peer_moves_by_device.get(placement.device_id)
         if peer is None:
             continue
-        # Where the peer sends it, rather than asserting it differs: the two
-        # designs may well target the SAME unit, in which case this is a
-        # second, independent reason the plans cannot both come true.
-        if peer.target_rack_id and peer.target_position is not None:
-            where = f"{peer.target_rack} U{_fmt_u(peer.target_position)}"
-        else:
-            where = "another location"
+        # docs/peer-conflicts.md documents only the peer design's TITLE as
+        # disclosed when the reader cannot view it -- naming the peer's own
+        # destination rack and unit is a field of the hidden design's
+        # placement beyond that, so it is dropped rather than reported (it
+        # was never needed to make the conflict actionable: the reader
+        # already knows their own device and their own planned destination,
+        # only that ANOTHER design also wants to move it).
         conflicts.append(_conflict(
             "peer_device_claim",
             severity=_peer_severity(peer.design),
             placement=placement,
             source_design=peer.design,
-            detail=f"{peer.design} also plans to move {placement.device} "
-                   f"(to {where}).",
+            detail=f"{peer.design} also plans to move {placement.device}.",
         ))
 
     return conflicts

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name =  "netbox-rack-design"
-version = "0.32.1"
+version = "0.33.0"
 authors = [
     {name = "Petr Voronov", email = "ravenrs@gmail.com"},
 ]
@@ -20,10 +20,11 @@ keywords = ["netbox", "netbox-plugin"]
 classifiers=[
     'Development Status :: 4 - Beta',
     'Framework :: Django',
-    # The supported NetBox range spans three Django majors: 4.4.x and 4.5.x ship
-    # Django 5.2, 4.6.x ships Django 6.0.
+    # The supported NetBox range spans four Django releases: 4.4.x and 4.5.x ship
+    # Django 5.2, 4.6.x ships Django 6.0, 4.7.x ships Django 6.1.
     'Framework :: Django :: 5.2',
     'Framework :: Django :: 6.0',
+    'Framework :: Django :: 6.1',
     'Intended Audience :: Developers',
     'Intended Audience :: System Administrators',
     'Intended Audience :: Telecommunications Industry',

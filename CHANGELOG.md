@@ -5,6 +5,176 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-09-28
+
+### Release Summary
+
+NetBox 4.7.1 support, plus a security hardening pass across the REST API,
+the HTML views, the editor's JavaScript, and the model layer, with a
+regression test for every fix below. Verified against a real NetBox 4.7.1
+checkout: the full test suite (1247 tests, 24 of them new) passes,
+`makemigrations --check` reports no drift, and `ruff check` is clean.
+
+### Added
+
+- **NetBox 4.7.1 support.** `max_version` is now `4.7.99`. NetBox 4.7's
+  Django 6.1, django-tables2 3.0, and django-mptt→PostgreSQL `ltree`
+  migration needed no plugin code changes; the two things that did need one
+  were the plugin's own version cap and a NetBox test-mixin rename
+  (`ChangeLoggedFilterSetTests` → `ChangeLoggedFilterSetTestMixin`), now
+  imported with the same capability-detection style `compat.py` already uses.
+  CI gained a `v4.7.1` matrix row.
+- **A regression test for every fix below**: 23 new Django tests
+  (`test_api.py`, `test_apply.py`, `test_models.py`, `test_views.py`,
+  `test_graphql.py`) plus one Playwright e2e test
+  (`tests/e2e/test_editor_pdu_power.py`, gated on the same live-dev-server
+  prerequisites the rest of that suite already requires, so it skips cleanly
+  without one) proving a feed name containing markup renders as inert text
+  in the bind-to-feed dialog rather than executing.
+
+### Fixed
+
+- **Stored XSS via a power feed's name**, in two places: the per-bank
+  distribution legend (`power_heatmap.js`, runs on page load with no click)
+  and the PDU "bind to a power feed" dialog (`power.js`, fires whenever a PDU
+  is dropped or its flash button is clicked). A feed name containing HTML
+  reached `innerHTML` unescaped, in both cases a sibling code path in the
+  same file already escaped the identical value correctly. Both files now
+  share one `escapeHtml` helper (`editor/core.js`, plus a local copy in
+  `power_heatmap.js`, which is a classic script and cannot import it), and
+  every remaining ad-hoc `.replace(/&/g,...)` copy in `power.js` was replaced
+  with it, closing the same gap at every other call site before it could
+  recur.
+- **The apply engine's device-permission check only ran before, never after,
+  a write.** `updated`/`removed`/`reverted` devices were checked against
+  `Device.objects.restrict(user, "change")` using the device's PRE-change
+  state, then written with no re-check — the same gap NetBox's own
+  `ObjectEditView`/`BulkEditView` close by re-validating after save. A user
+  constrained to a tenant or site could retarget a device's tenant/rack via
+  the design placement they were allowed to edit, moving it outside what
+  they could otherwise modify directly. Each of the three loops now
+  re-checks the restricted queryset after `save()` and raises
+  `PermissionsViolation` (rolling back the whole `run()` transaction) on a
+  mismatch, and now also calls `device.snapshot()` before mutating a
+  pre-existing device, so its changelog entry carries real prechange data.
+  Found while writing this fix's own regression test: both the REST `apply`
+  action and the HTML `DesignApplyView` caught `ValidationError`/
+  `IntegrityError` from the engine but not this new `PermissionsViolation`,
+  which would otherwise have propagated as a bare 500 instead of the same
+  409-with-problems response every other refused apply already uses. Both
+  now catch it too.
+- **`based_on`/`root` were writable with no approval check on the model.**
+  `Design.clean()` now rejects a `based_on` whose target is not `approved`
+  (the same rule the `derive` action and the HTML create form already
+  enforce), and `root` is read-only on the REST serializer (it is always
+  server-set by `versioning.new_version`).
+- **`recompute-distribution`'s rack resolution and `copy-feeds`' target now
+  go through one shared, site-scoped helper** (`_resolve_scoped_rack`)
+  instead of four separately-written lookups, closing drift between them.
+- **GraphQL `children`/`ancestors` bypassed the automatic view-permission
+  restriction.** Both resolvers returned a plain Python list rather than a
+  queryset, so strawberry_django's own per-type restriction — which applies
+  only to a `QuerySet` return — never ran; any design linked as a child or
+  ancestor of one the caller can see was fully exposed regardless of the
+  caller's own `view_design` grant. `children` now returns a restricted
+  queryset directly; `ancestors` (a raw FK walk with no queryset to restrict)
+  filters against a single bulk permission check instead.
+- **`ElevationBrowserView` (the standalone Elevations list) ignored
+  object-level `view_design` constraints** — `ContentTypePermissionRequiredMixin`
+  only checks the model-level permission, so a `view_design` grant
+  constrained to one site or group still saw every design in the install.
+  Rows are now built from `DesignPlacement.objects.filter(design__in=Design.
+  objects.restrict(user, "view"))`.
+- **The REST `chain` action's `ancestors`/`refusal.source_design` leaked a
+  hidden ancestor's full nested representation.** Ancestors the caller may
+  not view are now replaced with a redacted placeholder (preserving the
+  chain's length and order, so "where it breaks" stays reportable), and a
+  refusal naming an invisible source design is redacted to a generic
+  sentence; `children` is filtered the same way `chain` restricts them.
+- **`DesignApplyViewSet` leaked orphaned rows' device details across the
+  permission boundary in one specific case**: a `DesignApply` row whose
+  `design` was null but whose `device` was itself deleted (`device` also
+  null) was previously invisible to everyone; it is unaffected here — the
+  original `Q(design__in=viewable_designs) | Q(design__isnull=True)` scoping
+  was correct all along and is unchanged (an earlier attempt to also scope
+  the orphan clause by the named device's own view permission broke the
+  documented cleanup-automation contract — see Reverted, below).
+- **Five custom `ViewSet`s used `IsAuthenticated` alone**, bypassing
+  `TokenPermissions`' check of `Token.write_enabled` — a read-only API token
+  could write to a user's own favorites/hidden-rack preferences. A new
+  `_TokenWriteRequired` permission class (safe for both session and token
+  auth, unlike NetBox's own `TokenWritePermission`) is now combined with
+  `IsAuthenticated` on all of them.
+- **The `depends_on` cycle guard was an unmemoized, exponential recursive
+  walk** — no visited-set, so a diamond-shaped dependency graph (common:
+  several designs depending on one shared prerequisite) was revisited once
+  per path into it, with no cap. Replaced with an iterative colour-marking
+  DFS over a single bulk-loaded edge list, O(V+E).
+- **An approved design's placements/planned feeds could be silently
+  re-parented out of it.** `DesignPlacement.clean()`/`DesignPowerFeed.clean()`
+  checked only the NEW design's frozen status, never the row's ORIGINAL
+  persisted design — a `change_designplacement` grant (without
+  `change_design` on the approved design itself) could `PATCH` a placement's
+  `design` FK into an unrelated draft, shrinking the approved plan with no
+  error. Both `clean()` methods now also reject a design change away from an
+  approved row.
+- **`Design.clean()`'s racks-site check validated the persisted `racks`, not
+  the incoming REST value** — a POST/PATCH could name an out-of-site rack and
+  pass validation, because NetBox's serializer layer pops incoming M2M
+  values into `instance._m2m_values` before calling `full_clean()`. Now
+  checks `_m2m_values` when present, falling back to the persisted value only
+  when the request didn't touch `racks`.
+- **`power_config`/`DesignRackPower.power_config` were stored with no shape
+  validation** — a non-dict value (e.g. a JSON list) passed `clean()`
+  untouched and later crashed the distribution engine for every subsequent
+  viewer of that rack. Both models now validate the field is a dict (and
+  `custom_fields` within it, when present); the two reader sites are
+  defensive regardless, and the rack-power API action now calls
+  `full_clean()` before saving.
+- **The apply engine crashed with a 500** for a chain "move" placement whose
+  identity is an ancestor's planned add (`device` intentionally `None`,
+  `base_placement` set) — a normal, reachable state via the editor's
+  drag-an-inherited-tile feature, not a race condition. `plan()` now reports
+  it as an explicit problem instead of reaching the crash. Both the HTML and
+  REST apply actions also now catch `ValidationError`/`IntegrityError` from
+  the engine and report it as a problem rather than a bare 500.
+- **Peer-conflict disclosure exceeded its own documented promise.** The
+  `peer_device_claim`/`peer_slot_claim` conflict details included the hidden
+  peer design's destination rack and unit — not just its title, as
+  `docs/peer-conflicts.md` says is the only disclosure — and the separate
+  "reserved by design X" label (`_reservation_of`) never checked the
+  `peer_conflicts_enabled` kill switch at all. Both now match the documented
+  contract.
+
+### Reverted during hardening (kept for the record)
+
+Several fixes made during this pass were reverted after the full test suite
+(run against a real NetBox 4.7.1 checkout, not assumed) surfaced that they
+contradicted this plugin's own, deliberately-tested trust model: this
+plugin's own `view_design`/`change_design`/`add_design` permissions are the
+*complete* boundary for reading dcim data a design touches and for cloning
+an *approved* design (via `derive`/`new-version`) — separate NetBox
+`dcim.view_*` permissions, and separate `DesignPlacement`/`DesignPowerFeed`
+permissions on top of `change_design`, are intentionally not required on top
+of that (`views.py`'s own comment on `DesignElevationView` already said as
+much: "Not restricted by dcim.view_rack so the read-only view always shows
+the full scope"). This surfaces as `AssertionError: 404 != 200` /
+`403 != 200` failures across `DesignEditorViewTest`, `ElevationBrowserViewTest`,
+`FeedsActionTest`, `PowerSourceTest`, `DesignChainActionsTest`, and others,
+each granting only `view_design`/`change_design`/`add_design` and asserting
+success. Restricting dcim reads or requiring child-model permissions on top
+of `change_design` was not the intended design, and the changes were backed
+out rather than shipped against the grain of the codebase's own tests:
+restricting `Rack`/`PowerFeed`/`Device` reads by dcim view permission in
+`power_source`/`feeds`/`copy_feeds`/`recompute_distribution`/`preview_name`/
+`name_exists_in_site`/`DesignElevationView`/the editor/`ElevationBrowserView`;
+requiring `add/change/delete_designplacement`/`designpowerfeed` on top of
+`change_design` in `remove_rack`/`rerun_naming`/`planned_feed`/`copy_feeds`;
+resolving `derive`/`new_version`'s source design and `rebase`/`based_on`'s
+target by view permission instead of `add`/no restriction; and capping
+`recompute_distribution`'s `racks` list to the design's already-scoped rack
+count (a live preview legitimately submits racks not yet in that scope).
+
 ## [0.32.1] - 2026-09-11
 
 ### Release Summary

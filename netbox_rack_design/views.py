@@ -1,6 +1,7 @@
 """Views for NetBox Rack Design."""
 
 import json
+import logging
 import os
 
 from dcim.models import PowerFeed, Rack, Site
@@ -9,7 +10,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.staticfiles import finders
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -19,6 +20,7 @@ from django.views.generic import View
 from django_tables2 import RequestConfig
 from netbox.plugins import get_plugin_config
 from netbox.views import generic
+from utilities.exceptions import PermissionsViolation
 from utilities.paginator import EnhancedPaginator, get_paginate_count
 from utilities.query import count_related
 from utilities.views import ContentTypePermissionRequiredMixin, register_model_view
@@ -29,6 +31,8 @@ from .choices import DesignStatusChoices
 from .distribution import DEFAULT_DISTRIBUTION_MODE
 
 PLUGIN_NAME = "netbox_rack_design"
+
+logger = logging.getLogger("netbox_rack_design.views")
 
 __all__ = (
     "DesignGroupView", "DesignGroupListView", "DesignGroupEditView", "DesignGroupDeleteView",
@@ -290,7 +294,10 @@ class DesignElevationView(generic.ObjectView):
         # The design's planning scope (design.racks), ordered by name — the same
         # ordering the editor's multi-rack workspace uses. Not restricted by
         # dcim.view_rack so the read-only view always shows the full scope, like
-        # the editor does.
+        # the editor does: this plugin's own view_design permission is the
+        # complete, self-sufficient boundary for reading dcim data a design
+        # touches (a planner routinely has change_design with no separate dcim
+        # permissions at all -- see e.g. test_editor_context_includes_scoped_racks).
         scoped_racks = list(
             instance.racks.select_related("site", "location").order_by("name", "pk")
         )
@@ -1109,12 +1116,26 @@ class ElevationBrowserView(ContentTypePermissionRequiredMixin, View):
     def get_required_permission(self):
         return "netbox_rack_design.view_design"
 
-    def _build_rows(self):
-        """Derive one row dict per distinct (design, rack) the design touches."""
+    def _build_rows(self, user):
+        """Derive one row dict per distinct (design, rack) the design touches,
+        restricted to designs ``user`` may view.
+
+        Unlike ``ContentTypePermissionRequiredMixin`` (model-level: it "does
+        not enforce object-level permissions" -- NetBox core), this method IS
+        the object-level gate for DESIGNS: without it, any holder of a
+        blanket ``view_design`` grant -- even one object-constrained to a
+        single site or group -- saw every design touched by ANY design in
+        the install. Not further restricted by ``dcim.view_rack``: this
+        plugin's own ``view_design`` permission is the complete,
+        self-sufficient boundary for reading dcim data a design touches (see
+        e.g. ``ElevationBrowserViewTest``, which grants only ``view_design``
+        and expects to see every row for the designs it can view).
+        """
         placements = (
             models.DesignPlacement.objects.filter(
                 Q(target_rack__isnull=False) | Q(device__rack__isnull=False)
             )
+            .filter(design__in=models.Design.objects.restrict(user, "view"))
             .select_related(
                 "design", "design__site",
                 "target_rack", "target_rack__site",
@@ -1168,7 +1189,7 @@ class ElevationBrowserView(ContentTypePermissionRequiredMixin, View):
         return rows
 
     def get(self, request):
-        all_rows = self._build_rows()
+        all_rows = self._build_rows(request.user)
 
         sel_designs = self._selected_ids(request, "design")
         sel_racks = self._selected_ids(request, "rack")
@@ -1684,6 +1705,11 @@ class DesignRebaseView(generic.ObjectView):
         form = DesignRebaseForm(request.POST)
         if form.is_valid():
             previous_based_on = design.based_on_id
+            # Snapshot before mutating, matching the pattern signals.py
+            # already uses for placements (and the REST rebase action, above):
+            # without it, this design's changelog entry would record the new
+            # based_on with no prechange_data to compare it against.
+            design.snapshot()
             design.based_on = form.cleaned_data["based_on"]
             try:
                 design.full_clean()
@@ -1734,9 +1760,27 @@ class DesignApplyView(generic.ObjectView):
         # describes -- an edit, not a create.
         return "netbox_rack_design.change_design"
 
+    # Defense in depth: plan()/run() report every KNOWN unworkable state as a
+    # problem string rather than raising (see apply.py's plan(), bay-placement
+    # and chain-move handling), so this is a backstop for a genuinely
+    # unexpected failure (e.g. a concurrent-modification IntegrityError, or
+    # _execute()'s own PermissionsViolation), not the primary way problems are
+    # reported.
+    @staticmethod
+    def _run_engine(callable_, design, user, request):
+        try:
+            return callable_(design, user), None
+        except (ValidationError, IntegrityError, PermissionsViolation) as exc:
+            logger.warning("DesignApplyView: design=%s raised %r", design.pk, exc)
+            detail = "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc)
+            messages.error(request, detail or "The apply could not be completed.")
+            return None, redirect(design.get_absolute_url())
+
     def get(self, request, pk):
         design = self.get_object(pk=pk)
-        result = apply_engine.plan(design, request.user)
+        result, early_return = self._run_engine(apply_engine.plan, design, request.user, request)
+        if early_return is not None:
+            return early_return
         return render(request, self.template_name, {
             "object": design,
             "result": result,
@@ -1745,7 +1789,9 @@ class DesignApplyView(generic.ObjectView):
 
     def post(self, request, pk):
         design = self.get_object(pk=pk)
-        result = apply_engine.run(design, request.user)
+        result, early_return = self._run_engine(apply_engine.run, design, request.user, request)
+        if early_return is not None:
+            return early_return
         if result.ok:
             messages.success(
                 request,

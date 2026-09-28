@@ -48,6 +48,20 @@
         if (window.__rdTrace) { window.__rdTrace("heat." + ev, data || {}); }
     }
 
+    // HTML-escaping helper for the string-built distribution legend below.
+    // This file is a classic script (no `type="module"`), so it cannot import
+    // the equivalent helper from editor/core.js -- this is a local copy,
+    // encoding everything with special meaning in element-text and
+    // quoted-attribute contexts (`&`, `<`, `>`, `"`, `'`).
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
     // The visible name a tile currently shows: the rename overlay if present,
     // else the identity label unless it's hidden. "" means the tile renders
     // BLANK (the just-placed-on-a-removed-slot bug -- user 2026-07-16).
@@ -307,19 +321,29 @@
             var first = byPdu[pduName][0];
             // Header carries the feed color (A blue / B orange) + a 3φ flag for
             // three-phase PDUs; it matches the tiles' accent edge = the key.
-            var head = first.feed + (first.phase === 3 ? " 3φ" : "");
+            // The feed NAME is free-text set by whoever can name a power feed
+            // (real or planned), so it must be escaped before landing in
+            // innerHTML -- unlike feedLetter/state below, it is not a value
+            // this engine ever constrains to a small fixed set.
+            var head = escapeHtml(first.feed) + (first.phase === 3 ? " 3φ" : "");
+            // feedLetter and state land in CSS class names, not text content --
+            // whitelisted rather than HTML-escaped, since an escaped-but-still-
+            // unexpected token could still break out of the class attribute
+            // (e.g. a value containing a space or quote).
+            var feedLetter = /^[a-z]$/.test(first.feedLetter) ? first.feedLetter : "a";
             var chips = byPdu[pduName].map(function (b) {
                 // A mini "health bar" per bank: the fill is the load/breaker
                 // ratio, colored by state -- same idea as the rack power bar.
                 var w = Math.max(0, Math.min(100, b.util || 0));
-                return '<span class="nbx-rd-dist-chip nbx-rd-dist-' + b.state + '">'
+                var state = ["ok", "warn", "critical"].indexOf(b.state) !== -1 ? b.state : "ok";
+                return '<span class="nbx-rd-dist-chip nbx-rd-dist-' + state + '">'
                     + '<span class="nbx-rd-dist-fill" style="width:' + w.toFixed(1) + '%"></span>'
-                    + '<span class="nbx-rd-dist-label">B' + b.bank + ": "
+                    + '<span class="nbx-rd-dist-label">B' + escapeHtml(b.bank) + ": "
                     + Math.round(b.load) + "/" + Math.round(b.max) + " W</span>"
                     + "</span>";
             }).join("");
             return '<div class="nbx-rd-dist-pdu">'
-                + '<span class="nbx-rd-dist-pdu-head nbx-rd-feedhead-' + first.feedLetter
+                + '<span class="nbx-rd-dist-pdu-head nbx-rd-feedhead-' + feedLetter
                 + '">' + head + "</span>" + chips + "</div>";
         }).join("");
         legend.innerHTML = cols;

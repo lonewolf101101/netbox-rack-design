@@ -7,7 +7,7 @@
  */
 
 import { rdTrace } from "rd/trace.js";
-import { getCsrfToken, createToast } from "rd/core.js";
+import { getCsrfToken, createToast, escapeHtml } from "rd/core.js";
 
 // The editor's root element. editor.js reads it once and returns early when it
 // is absent; this module is imported unconditionally, so API_BASE below guards
@@ -149,7 +149,7 @@ function renderPlacementRail() {
     var fields = PLACEMENT_FIELDS.filter(function (f) { return f.rail; });
     if (!fields.length) { return; }
     placementRailEl.innerHTML = fields.map(function (f) {
-        var safeLabel = String(f.label || f.key).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+        var safeLabel = escapeHtml(f.label || f.key);
         return '<div class="nbx-rd-toolbar-field d-flex align-items-center gap-2">'
             + '<label class="form-label small mb-0 text-nowrap">' + safeLabel + "</label>"
             + planningFieldInputHtml(f, "nbx-rd-placement-rail-field") + "</div>";
@@ -444,7 +444,7 @@ function racksInDom() {
 
 function rackOptionsHtml(racks, selectedId) {
     return racks.map(function (r) {
-        var safe = String(r.name).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+        var safe = escapeHtml(r.name);
         var sel = (selectedId != null && String(r.id) === String(selectedId)) ? " selected" : "";
         return '<option value="' + r.id + '"' + sel + ">" + safe + "</option>";
     }).join("");
@@ -537,7 +537,7 @@ function showPduPowerDialog(widget, content, ctx) {
     } else if (showCfSection) {
         var pduRacks = racksInDom();
         var manualFieldsHtml = pduFields.map(function (f) {
-            var safeLabel = String(f.label || f.key).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+            var safeLabel = escapeHtml(f.label || f.key);
             return '<div class="col"><label class="form-label small mb-0">' + safeLabel + "</label>"
                 + planningFieldInputHtml(f) + "</div>";
         }).join("");
@@ -672,14 +672,14 @@ function showPduPowerDialog(widget, content, ctx) {
                 // from an identically-named feed of their own.
                 var inheritedTag = f.inherited
                     ? ' <span class="text-muted small nbx-rd-feed-inherited-tag">— from '
-                        + String(f.design_name || "another design").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                        + escapeHtml(f.design_name || "another design")
                         + "</span>"
                     : "";
                 return '<label class="form-check' + (f.inherited ? " nbx-rd-feed-inherited" : "") + '">'
                     + '<input class="form-check-input" type="radio" name="nbx-rd-feed-pick" '
                     + 'data-source="' + source + '" data-id="' + f.id + '"'
                     + (checked ? " checked" : "") + ">"
-                    + '<span class="form-check-label">' + feedRowLabel(f) + inheritedTag + "</span>"
+                    + '<span class="form-check-label">' + escapeHtml(feedRowLabel(f)) + inheritedTag + "</span>"
                     + "</label>";
             }).join("");
             return '<div class="nbx-rd-feed-section"><div class="text-muted small text-uppercase">'
@@ -706,7 +706,7 @@ function showPduPowerDialog(widget, content, ctx) {
             byDesign[key].feeds.push(f);
         });
         inheritedGroups.forEach(function (g) {
-            var safeName = String(g.name || "ancestor design").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+            var safeName = escapeHtml(g.name || "ancestor design");
             html += section("Planned feeds — inherited from " + safeName, g.feeds, "planned");
         });
         listEl.innerHTML = html;
@@ -777,8 +777,7 @@ function showPduPowerDialog(widget, content, ctx) {
         sel.innerHTML = '<option value="">— loading… —</option>';
         fetchRackPdus(forRackId).then(function (pdus) {
             var opts = '<option value="">— select a PDU —</option>' + pdus.map(function (d) {
-                var nm = String(d.display || d.name || ("device " + d.id))
-                    .replace(/&/g, "&amp;").replace(/</g, "&lt;");
+                var nm = escapeHtml(d.display || d.name || ("device " + d.id));
                 var sel2 = (preselectId != null && String(d.id) === String(preselectId)) ? " selected" : "";
                 return '<option value="' + d.id + '"' + sel2 + ">" + nm + "</option>";
             }).join("");
@@ -880,17 +879,18 @@ function showPduPowerDialog(widget, content, ctx) {
 // custom_fields dict key written on confirm.
 function planningFieldInputHtml(f, cssClass) {
     var cls = cssClass || "nbx-rd-rackpower-field";
+    var safeKey = escapeHtml(f.key);
     if (f.type === "choice") {
         var opts = '<option value="">—</option>' + (f.choices || []).map(function (c) {
-            var safe = String(c).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+            var safe = escapeHtml(c);
             return '<option value="' + safe + '">' + safe + "</option>";
         }).join("");
         return '<select class="form-select form-select-sm ' + cls + '" data-field-key="'
-            + f.key + '">' + opts + "</select>";
+            + safeKey + '">' + opts + "</select>";
     }
     var type = f.type === "number" ? "number" : "text";
     return '<input type="' + type + '" class="form-control form-control-sm ' + cls + '" data-field-key="'
-        + f.key + '">';
+        + safeKey + '">';
 }
 
 // ---- The per-tile planning-attributes dialog ---------------------------
@@ -908,12 +908,12 @@ function showPlacementFieldsDialog(widget, content, kind) {
     overlay.className = "modal fade nbx-rd-placement-modal";
     overlay.setAttribute("tabindex", "-1");
     var rowsHtml = fields.map(function (f) {
-        var safeLabel = String(f.label || f.key).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+        var safeLabel = escapeHtml(f.label || f.key);
         return '<div class="mb-2"><label class="form-label small mb-0">' + safeLabel
             + (f.required ? ' <span class="text-danger">*</span>' : "")
             + "</label>" + planningFieldInputHtml(f, "nbx-rd-placement-field") + "</div>";
     }).join("");
-    var title = (widget.proposed_name || widget.label || "device").replace(/</g, "&lt;");
+    var title = escapeHtml(widget.proposed_name || widget.label || "device");
     overlay.innerHTML =
         '<div class="modal-dialog modal-dialog-centered">'
         + '<div class="modal-content">'
@@ -1038,7 +1038,7 @@ function buildRackPowerDialog(rackId, rackName, existing) {
     var scriptMode = DISTRIBUTION_MODE === "script";
     var fields = scriptMode ? ((PLANNING_FIELDS && PLANNING_FIELDS.rack) || []) : [];
     var fieldsHtml = fields.map(function (f) {
-        var safeLabel = String(f.label || f.key).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+        var safeLabel = escapeHtml(f.label || f.key);
         return '<div class="col"><label class="form-label small mb-0">' + safeLabel + "</label>"
             + planningFieldInputHtml(f) + "</div>";
     }).join("");
@@ -1047,7 +1047,7 @@ function buildRackPowerDialog(rackId, rackName, existing) {
         + '<div class="modal-content">'
         + '<div class="modal-header">'
         + '<h5 class="modal-title">' + "Rack power (planning input)"
-        + (rackName ? " — " + rackName.replace(/</g, "&lt;") : "") + "</h5>"
+        + (rackName ? " — " + escapeHtml(rackName) : "") + "</h5>"
         + '<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>'
         + "</div>"
         + '<div class="modal-body">'
@@ -1104,7 +1104,7 @@ function buildRackPowerDialog(rackId, rackName, existing) {
                 return '<div class="d-flex align-items-center justify-content-between'
                     + ' border-bottom py-1">'
                     + '<span class="small">'
-                    + String(feedRowLabel(f)).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    + escapeHtml(feedRowLabel(f))
                     + "</span>"
                     + '<button type="button" class="btn btn-sm btn-ghost-danger'
                     + ' nbx-rd-planned-del" data-feed-id="' + f.id + '"'

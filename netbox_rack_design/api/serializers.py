@@ -99,7 +99,12 @@ class DesignSerializer(NetBoxModelSerializer):
     )
     site = SiteSerializer(nested=True)
     group = NestedDesignGroupSerializer(required=False, allow_null=True)
-    root = NestedDesignSerializer(required=False, allow_null=True)
+    # Read-only: server-set by versioning.new_version() when a new version of
+    # a plan is created. A client-writable `root` let a design be POSTed
+    # pointing at any OTHER plan's root, joining that plan's version group
+    # (models.py's "at most one approved version" and "cannot delete a root
+    # with versions" guards then apply to a row its real owners never made).
+    root = NestedDesignSerializer(read_only=True)
     based_on = NestedDesignSerializer(required=False, allow_null=True)
     depends_on = SerializedPKRelatedField(
         queryset=Design.objects.all(),
@@ -122,7 +127,6 @@ class DesignSerializer(NetBoxModelSerializer):
             "created", "last_updated",
         )
         brief_fields = ("id", "url", "display", "title", "version", "status")
-
 
 class NestedDesignPlacementSerializer(WritableNestedSerializer):
     url = serializers.HyperlinkedIdentityField(

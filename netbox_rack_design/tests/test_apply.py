@@ -16,7 +16,9 @@ from django.core.exceptions import ValidationError
 from django.db import connection, transaction
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from tenancy.models import Tenant
 from users.models import ObjectPermission, User
+from utilities.exceptions import PermissionsViolation
 
 from .. import apply
 from ..choices import DesignPlacementKindChoices, DesignStatusChoices
@@ -174,6 +176,92 @@ class PreconditionTestCase(ApplyTestCase):
                 for p in result.problems),
             result.problems,
         )
+
+    def test_retargeting_a_devices_tenant_outside_a_constrained_grant_is_blocked(self):
+        """
+        Regression test: ``plan()``'s permission pre-check only verified a
+        device against ``restrict(user, "change")`` using its state BEFORE
+        the write -- a user constrained to one tenant could still retarget an
+        existing planned device's TENANT to a different one via the
+        placement's own tenant override, because the pre-check still matched
+        the device's old (still-current-at-plan-time) tenant. ``_execute()``
+        now re-checks the SAME restricted queryset after each device.save()
+        and raises ``PermissionsViolation`` (rolling back the whole
+        transaction) when the write moves the device outside it -- matching
+        NetBox core's own ObjectEditView/BulkEditView post-save re-validation.
+        """
+        other_tenant = Tenant.objects.create(name="Other Tenant", slug="other-tenant")
+
+        design = self._design("Retarget tenant")
+        placement = self._add(
+            design, 10, name="retarget-srv", role=self.device_role, tenant=self.tenant
+        )
+        self._approve(design)
+        result = apply.run(design, self.superuser)
+        self.assertTrue(result.ok, result.problems)
+        device = result.created[0].device
+        self.assertEqual(device.tenant_id, self.tenant.pk)
+
+        # Constrained to the device's CURRENT tenant only.
+        user = User.objects.create_user(username="tenant-constrained")
+        permission = ObjectPermission(
+            name="constrained-to-original-tenant", actions=["change"],
+            constraints={"tenant_id": self.tenant.pk},
+        )
+        permission.save()
+        permission.users.add(user)
+        permission.object_types.add(ObjectType.objects.get_for_model(Device))
+
+        # Re-open the design and retarget the SAME placement to another tenant.
+        design.status = DesignStatusChoices.STATUS_DRAFT
+        design.save()
+        placement.tenant = other_tenant
+        placement.save()
+        self._approve(design)
+
+        with self.assertRaises(PermissionsViolation):
+            apply.run(design, user)
+
+        device.refresh_from_db()
+        self.assertEqual(
+            device.tenant_id, self.tenant.pk,
+            "the whole run() transaction must roll back -- nothing partially applied",
+        )
+
+    def test_chain_move_with_no_device_yet_reports_problem_not_crash(self):
+        """
+        Regression test: a chain "move" placement whose identity is an
+        ancestor's planned add (``base_placement`` set, ``device``
+        intentionally ``None`` -- the model explicitly allows this shape) used
+        to crash ``plan()`` with an ``AttributeError`` on ``pl.device.
+        device_type`` -- a real, permanently-reachable state (via the editor's
+        drag-an-inherited-tile feature), not a race condition, since nothing
+        ever fills in ``device`` for this row. It must be reported as an
+        ordinary problem instead, exactly like a bay placement.
+        """
+        ancestor = self._design("Ancestor for chain move")
+        ancestor_add = self._add(ancestor, 10, name="ancestor-add")
+        self._approve(ancestor)
+
+        design = self._design("Chain move", based_on=ancestor)
+        move = DesignPlacement.objects.create(
+            design=design,
+            kind=DesignPlacementKindChoices.KIND_MOVE,
+            base_placement=ancestor_add,
+            target_rack=self.racks[0],
+            target_position=15,
+            target_face="front",
+        )
+        self._approve(design)
+
+        result = apply.plan(design, self.superuser)  # must not raise
+        self.assertFalse(result.ok)
+        self.assertTrue(
+            any("ancestor" in p.lower() for p in result.problems),
+            result.problems,
+        )
+        self.assertNotIn(move.pk, [c.placement.pk for c in result.created])
+        self.assertNotIn(move.pk, [u.placement.pk for u in result.updated])
 
     def test_bay_placement_reports_problem_not_skipped(self):
         design = self._design("Has a blade")

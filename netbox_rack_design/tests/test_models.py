@@ -137,6 +137,21 @@ class DesignTestCase(TestCase):
         child = Design(title="Child", site=self.site, based_on=parent)
         child.full_clean()  # must not raise
 
+    def test_based_on_a_non_approved_design_rejected(self):
+        """
+        A design's entire placement layer is replayed into anything based on
+        it (``projection.resolve_baseline_chain``), so the parent must
+        already be a trustworthy, frozen baseline -- exactly the rule
+        ``derive``/``DesignDeriveView`` enforce for the sibling "create a
+        child" flow. Without this, ``based_on`` could point at a design still
+        being edited.
+        """
+        draft_parent = Design.objects.create(title="Draft parent", site=self.site)
+        child = Design(title="Child", site=self.site, based_on=draft_parent)
+        with self.assertRaises(ValidationError) as ctx:
+            child.full_clean()
+        self.assertIn("based_on", ctx.exception.message_dict)
+
     # --- baseline_chain() ----------------------------------------------------
 
     def test_baseline_chain_empty_with_no_parent(self):
@@ -198,6 +213,37 @@ class DesignTestCase(TestCase):
         # on a brand-new design just because depends_on can't be queried yet.
         design = Design(title="New", site=self.site)
         design.full_clean()  # must not raise
+
+    def test_depends_on_diamond_shape_is_not_a_false_positive_cycle(self):
+        """
+        Regression test for the cycle guard's rewrite (iterative colour-
+        marking DFS replacing an unmemoized recursive walk): a design graph
+        where TWO designs both depend on the SAME shared prerequisite (a
+        diamond, not a cycle -- D is reachable from A via both B and C) must
+        validate cleanly. The old recursive ``_walk`` tracked only the
+        CURRENT path, so a diamond was never a false positive either -- this
+        pins that the rewrite preserves it, since a "same node reached twice
+        overall" bug (conflating BLACK to a would-be second visit) would
+        silently reintroduce one.
+        """
+        a = Design.objects.create(title="A", site=self.site)
+        b = Design.objects.create(title="B", site=self.site)
+        c = Design.objects.create(title="C", site=self.site)
+        d = Design.objects.create(title="D", site=self.site)
+        a.depends_on.set([b, c])
+        b.depends_on.add(d)
+        c.depends_on.add(d)
+        a.full_clean()  # must not raise -- D is not revisited as a cycle
+
+    def test_depends_on_deep_chain_cycle_still_detected(self):
+        """A cycle several hops away from the node being validated (not just
+        a direct A->B->A) is still caught by the rewritten DFS."""
+        designs = [Design.objects.create(title=f"D{i}", site=self.site) for i in range(6)]
+        for i in range(5):
+            designs[i].depends_on.add(designs[i + 1])
+        designs[5].depends_on.add(designs[0])  # closes the cycle 6 hops out
+        with self.assertRaises(ValidationError):
+            designs[0].full_clean()
 
     # --- is_frozen (§2.2) -----------------------------------------------------
 
@@ -569,6 +615,33 @@ class DesignPlacementTestCase(TestCase):
         placement.refresh_from_db()
         self.assertEqual(placement.power_config, config)
 
+    def test_power_config_must_be_an_object(self):
+        """
+        Regression test: ``power_config`` was stored as-is with no shape
+        check, so a non-dict value (a JSON list, say) passed ``clean()``
+        untouched and later crashed the distribution engine's ``.get(...)``
+        call -- for every subsequent viewer of that rack, not just this
+        write.
+        """
+        placement = DesignPlacement(
+            design=self.design, kind=DesignPlacementKindChoices.KIND_ADD,
+            device_type=self.device_type, target_rack=self.racks[1],
+            target_position=10, power_config=[1, 2, 3],
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            placement.full_clean()
+        self.assertIn("power_config", ctx.exception.message_dict)
+
+    def test_power_config_custom_fields_must_be_an_object(self):
+        placement = DesignPlacement(
+            design=self.design, kind=DesignPlacementKindChoices.KIND_ADD,
+            device_type=self.device_type, target_rack=self.racks[1],
+            target_position=10, power_config={"custom_fields": "not-a-dict"},
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            placement.full_clean()
+        self.assertIn("power_config", ctx.exception.message_dict)
+
     def _pdu_add(self, **kwargs):
         return DesignPlacement.objects.create(
             design=self.design,
@@ -689,6 +762,44 @@ class DesignPlacementTestCase(TestCase):
         design.save()
         placement.target_position = 11
         placement.full_clean()  # must not raise
+
+    def test_cannot_reparent_a_placement_out_of_an_approved_design(self):
+        """
+        Regression test: the frozen-design check above only inspected the NEW
+        design being written to -- never the row's ORIGINAL, persisted
+        design. A user holding ``change_designplacement`` (not necessarily
+        ``change_design`` on the approved design itself) could re-point an
+        existing placement's ``design`` FK into a draft of their own,
+        silently shrinking the approved plan's content with no error.
+        """
+        approved = Design.objects.create(
+            title="Approved owner", site=self.site,
+            status=DesignStatusChoices.STATUS_APPROVED,
+        )
+        draft = Design.objects.create(title="Draft elsewhere", site=self.site)
+        placement = DesignPlacement.objects.create(
+            design=draft, kind=DesignPlacementKindChoices.KIND_ADD,
+            device_type=self.device_type, target_rack=self.racks[1],
+            target_position=10,
+        )
+        # Move it INTO the approved design first (allowed -- draft to approved
+        # is not what this guard is about; the model's OWN frozen check above
+        # already covers writing to an approved design's placements).
+        placement.design = approved
+        # Force the persisted row's design without full_clean(), the way a
+        # prior version was created directly approved, or a rebase left it --
+        # what matters here is what is PERSISTED, not how it got there.
+        DesignPlacement.objects.filter(pk=placement.pk).update(design=approved)
+
+        placement.refresh_from_db()
+        placement.design = draft  # attempt to move it back OUT of the approved design
+        with self.assertRaises(ValidationError):
+            placement.full_clean()
+
+        # The frozen-design check on the NEW design alone would have allowed
+        # this (draft is not frozen) -- confirms the guard is about the
+        # ORIGINAL design, not the new one.
+        self.assertTrue(approved.is_frozen)
 
     def test_cannot_bind_both_real_and_planned_feed(self):
         panel = PowerPanel.objects.create(site=self.site, name="Panel 1")
@@ -1852,6 +1963,23 @@ class DesignPowerFeedTestCase(TestCase):
         feed.amperage = 32
         feed.full_clean()  # must not raise
 
+    def test_cannot_reparent_a_feed_out_of_an_approved_design(self):
+        """Same re-parenting gap as DesignPlacement above: the frozen check
+        only inspects the NEW design, so moving an existing planned feed OUT
+        of an approved design (changing its rack capacity) used to pass."""
+        approved = Design.objects.create(
+            title="Approved feed owner 2", site=self.site,
+            status=DesignStatusChoices.STATUS_APPROVED,
+        )
+        draft = Design.objects.create(title="Draft elsewhere 2", site=self.site)
+        feed = DesignPowerFeed.objects.create(design=draft, rack=self.racks[0], name="Feed A")
+        DesignPowerFeed.objects.filter(pk=feed.pk).update(design=approved)
+
+        feed.refresh_from_db()
+        feed.design = draft
+        with self.assertRaises(ValidationError):
+            feed.full_clean()
+
 
 class DesignRackPowerTestCase(TestCase):
     @classmethod
@@ -1875,6 +2003,17 @@ class DesignRackPowerTestCase(TestCase):
         )
         rack_power.refresh_from_db()
         self.assertEqual(rack_power.power_config, config)
+
+    def test_power_config_must_be_an_object(self):
+        """Same shape validation as DesignPlacement.power_config -- added to
+        DesignRackPower, which previously had no clean() at all, after a
+        non-dict value here crashed effective_custom_fields() the same way."""
+        rack_power = DesignRackPower(
+            design=self.design, rack=self.racks[0], power_config="not-a-dict",
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            rack_power.full_clean()
+        self.assertIn("power_config", ctx.exception.message_dict)
 
     def test_unique_design_rack_constraint(self):
         DesignRackPower.objects.create(design=self.design, rack=self.racks[0])

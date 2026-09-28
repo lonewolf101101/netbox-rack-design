@@ -9,6 +9,24 @@
  * elements are looked up once at editor.js load time.
  */
 
+// Shared HTML-escaping helper for the string-built dialogs elsewhere in the
+// editor (see editor/power.js). Encodes every character with special meaning
+// in BOTH element-text and quoted-attribute contexts (`&`, `<`, `>`, `"`,
+// `'`), unlike the ad-hoc `.replace(/&/g,"&amp;").replace(/</g,"&lt;")`
+// idiom that used to be copy-pasted at each call site -- that idiom left
+// quotes unescaped, so a value landing in an attribute (e.g. `value="..."`)
+// could still break out of it. Prefer building new markup with
+// `document.createElement`/`textContent` instead of string concatenation;
+// use this only where a call site already builds an HTML string.
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 function getCsrfToken() {
     // Guarded, unlike the closure version: editor.js returned early when
     // #rd-editor was absent, so `root` was never null by the time this ran.
@@ -71,4 +89,4 @@ function createToast(level, title, message) {
 }
 
 
-export { getCsrfToken, createToast };
+export { getCsrfToken, createToast, escapeHtml };

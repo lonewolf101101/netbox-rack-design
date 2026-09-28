@@ -12,7 +12,12 @@ ChangeLoggedFilterSetTests)`` is core's own spelling; keep it.
 from dcim.models import DeviceRole
 from django.test import TestCase
 from tenancy.models import Tenant
-from utilities.testing import ChangeLoggedFilterSetTests, create_test_device
+
+try:  # NetBox 4.7+ renamed this mixin with a *TestMixin suffix
+    from utilities.testing import ChangeLoggedFilterSetTestMixin as ChangeLoggedFilterSetTests
+except ImportError:  # NetBox 4.4-4.6
+    from utilities.testing import ChangeLoggedFilterSetTests
+from utilities.testing import create_test_device
 
 from ..choices import DesignPlacementKindChoices, DesignStatusChoices
 from ..filtersets import (

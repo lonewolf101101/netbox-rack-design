@@ -2,7 +2,8 @@
 
 from decimal import Decimal
 
-from core.models import ObjectType
+from core.choices import ObjectChangeActionChoices
+from core.models import ObjectChange, ObjectType
 from dcim.choices import PowerFeedPhaseChoices
 from dcim.models import (
     Cable,
@@ -145,6 +146,50 @@ class DesignTest(APIViewTestCases.APIViewTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         design = Design.objects.get(pk=response.data["id"])
         self.assertEqual(set(design.racks.all()), set(self.racks))
+
+    def test_cross_site_rack_on_create_rejected(self):
+        """
+        Regression test: ``Design.clean()``'s racks-site check used to read
+        only the PERSISTED ``self.racks`` -- never the incoming value --  so
+        a POST naming an out-of-site rack passed full_clean() (checked
+        against the OLD, still-empty scope) and only the through-table write
+        actually put the design out of its own site's bounds. NetBox's
+        serializer layer pops incoming M2M values into
+        ``instance._m2m_values`` before calling ``full_clean()``, which the
+        model now reads when present.
+        """
+        self.add_permissions(
+            "netbox_rack_design.add_design", "netbox_rack_design.view_design"
+        )
+        other_site = Site.objects.create(name="Other API Site", slug="other-api-site")
+        other_rack = Rack.objects.create(name="Other Site Rack", site=other_site)
+        data = {
+            "title": "Cross-site attempt",
+            "site": self.site.pk,
+            "status": DesignStatusChoices.STATUS_DRAFT,
+            "racks": [other_rack.pk],
+        }
+        url = reverse("plugins-api:netbox_rack_design-api:design-list")
+        response = self.client.post(url, data, format="json", **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Design.objects.filter(title="Cross-site attempt").exists())
+
+    def test_cross_site_rack_on_update_rejected(self):
+        self.add_permissions(
+            "netbox_rack_design.change_design", "netbox_rack_design.view_design"
+        )
+        design = Design.objects.create(title="Update target", site=self.site)
+        other_site = Site.objects.create(name="Other API Site 2", slug="other-api-site-2")
+        other_rack = Rack.objects.create(name="Other Site Rack 2", site=other_site)
+        url = reverse(
+            "plugins-api:netbox_rack_design-api:design-detail", args=[design.pk]
+        )
+        response = self.client.patch(
+            url, {"racks": [other_rack.pk]}, format="json", **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        design.refresh_from_db()
+        self.assertEqual(design.racks.count(), 0)
 
     def test_is_frozen_present_and_read_only(self):
         """``is_frozen`` mirrors ``Design.is_frozen`` and cannot be written
@@ -359,6 +404,125 @@ class DesignChainActionsTest(APITestCase):
         design = Design.objects.create(title="No perm", site=self.site)
         response = self.client.get(self._chain_url(design), **self.header)
         self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
+    def test_chain_redacts_an_ancestor_the_caller_cannot_view(self):
+        """
+        ``ancestors``/``children`` used to be resolved via raw FK/reverse-FK
+        traversal with no view-permission check of their own (unlike the
+        subject design, which IS restricted) -- fully exposing a hidden
+        ancestor's/child's title, version and status just by sharing a chain
+        with a design the caller can see. A hidden ancestor is now redacted
+        in place (kept as a placeholder so the chain's length/order survives)
+        rather than exposed or silently dropped.
+        """
+        a = Design.objects.create(
+            title="Hidden ancestor", site=self.site,
+            status=DesignStatusChoices.STATUS_APPROVED,
+        )
+        b = Design.objects.create(
+            title="Visible middle", site=self.site, based_on=a,
+            status=DesignStatusChoices.STATUS_APPROVED,
+        )
+        c = Design.objects.create(title="Visible child", site=self.site, based_on=b)
+
+        # A view_design grant constrained to exclude `a` only.
+        permission = ObjectPermission(
+            name="chain-restricted", actions=["view"],
+            constraints={"pk__in": [b.pk, c.pk]},
+        )
+        permission.save()
+        permission.users.add(self.user)
+        permission.object_types.add(ObjectType.objects.get_for_model(Design))
+        # Confirm `a` really is hidden from this user before relying on it.
+        self.assertFalse(
+            Design.objects.restrict(self.user, "view").filter(pk=a.pk).exists()
+        )
+
+        response = self.client.get(self._chain_url(c), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        ancestors = response.data["ancestors"]
+        self.assertEqual(len(ancestors), 2, ancestors)  # length/order preserved
+        self.assertIsNone(ancestors[0]["id"])
+        self.assertNotIn("Hidden ancestor", str(ancestors[0]))
+        self.assertEqual(ancestors[1]["id"], b.pk)  # the visible one is untouched
+
+    def test_chain_children_omit_a_design_the_caller_cannot_view(self):
+        parent = Design.objects.create(
+            title="Parent", site=self.site,
+            status=DesignStatusChoices.STATUS_APPROVED,
+        )
+        visible_child = Design.objects.create(
+            title="Visible child", site=self.site, based_on=parent,
+        )
+        hidden_child = Design.objects.create(
+            title="Hidden child", site=self.site, based_on=parent,
+        )
+
+        permission = ObjectPermission(
+            name="children-restricted", actions=["view"],
+            constraints={"pk__in": [parent.pk, visible_child.pk]},
+        )
+        permission.save()
+        permission.users.add(self.user)
+        permission.object_types.add(ObjectType.objects.get_for_model(Design))
+        self.assertFalse(
+            Design.objects.restrict(self.user, "view").filter(pk=hidden_child.pk).exists()
+        )
+
+        response = self.client.get(self._chain_url(parent), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        child_ids = [row["id"] for row in response.data["children"]]
+        self.assertEqual(child_ids, [visible_child.pk])
+
+    def test_refusal_source_design_redacted_when_hidden(self):
+        """A refused chain's ``source_design`` -- the ancestor the break is
+        attributed to -- is redacted to a generic detail when the caller
+        cannot view it, rather than naming it."""
+        hidden_ancestor = Design.objects.create(
+            title="Hidden draft ancestor", site=self.site,
+            status=DesignStatusChoices.STATUS_DRAFT,
+        )
+        child = Design.objects.create(
+            title="Child", site=self.site, based_on=hidden_ancestor,
+        )
+
+        permission = ObjectPermission(
+            name="refusal-restricted", actions=["view"],
+            constraints={"pk": child.pk},
+        )
+        permission.save()
+        permission.users.add(self.user)
+        permission.object_types.add(ObjectType.objects.get_for_model(Design))
+        self.assertFalse(
+            Design.objects.restrict(self.user, "view").filter(pk=hidden_ancestor.pk).exists()
+        )
+
+        response = self.client.get(self._chain_url(child), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertFalse(response.data["resolves"])
+        refusal = response.data["refusal"]
+        self.assertIsNone(refusal["source_design"])
+        self.assertNotIn("Hidden draft ancestor", refusal["detail"])
+
+    # --- root is server-managed, never client-writable ------------------------
+
+    def test_root_is_read_only_on_create(self):
+        """``root`` is server-set by ``versioning.new_version`` -- a client
+        POSTing one (e.g. to join another plan's version group) must have it
+        silently ignored, not applied."""
+        self.add_permissions(
+            "netbox_rack_design.add_design", "netbox_rack_design.view_design"
+        )
+        other_root = Design.objects.create(title="Someone else's root", site=self.site)
+        url = reverse("plugins-api:netbox_rack_design-api:design-list")
+        response = self.client.post(
+            url,
+            {"title": "New design", "site": self.site.pk, "root": other_root.pk},
+            format="json", **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        created = Design.objects.get(pk=response.data["id"])
+        self.assertNotEqual(created.root_id, other_root.pk)
 
     # --- derive ---------------------------------------------------------------
 
@@ -3338,6 +3502,36 @@ class HiddenDesignRackTest(APITestCase):
                 (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
             )
 
+    def test_read_only_token_cannot_toggle_or_show_all(self):
+        """
+        This ViewSet (and its siblings -- favorites, favorite device types,
+        hidden chassis, placement-fields) use plain ``IsAuthenticated``, not
+        NetBox's ``TokenPermissions``, so a read-only API token (write_enabled
+        =False) used to be able to write here regardless. ``_TokenWriteRequired``
+        now checks that explicitly; GET stays allowed for any authenticated
+        token, matching SAFE_METHODS.
+        """
+        ro_token = Token.objects.create(user=self.user, write_enabled=False)
+        ro_header = api_token_header(ro_token)
+
+        response = self.client.get(
+            self._list_url(), {"design_id": self.design.pk}, **ro_header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        response = self.client.post(
+            self._toggle_url(),
+            {"design_id": self.design.pk, "rack_id": self.racks[0].pk},
+            format="json", **ro_header,
+        )
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(HiddenDesignRack.objects.filter(user=self.user).exists())
+
+        response = self.client.post(
+            self._show_all_url(), {"design_id": self.design.pk}, format="json", **ro_header,
+        )
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
 
 class DesignPowerFeedAPITest(APIViewTestCases.APIViewTestCase):
     """Planned feeds through the REST API, the twin of the new UI views."""
@@ -4153,6 +4347,28 @@ class FavoriteSetTest(APITestCase):
         response = self.client.get(self._sets_url())
         self.assertIn(response.status_code, (401, 403))
 
+    def test_read_only_token_cannot_create_update_or_delete_a_set(self):
+        """FavoriteSetViewSet uses plain IsAuthenticated, not TokenPermissions,
+        so a read-only API token used to be able to write to a user's own
+        favorites regardless of write_enabled. GET stays allowed."""
+        ro_token = Token.objects.create(user=self.user, write_enabled=False)
+        ro_header = api_token_header(ro_token)
+
+        response = self.client.get(self._sets_url(), **ro_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        default_id = response.data["results"][0]["id"]
+
+        response = self.client.post(
+            self._sets_url(), {"name": "should not be created"},
+            format="json", **ro_header,
+        )
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(FavoriteSet.objects.filter(name="should not be created").exists())
+
+        response = self.client.delete(self._set_url(default_id), **ro_header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(FavoriteSet.objects.filter(pk=default_id).exists())
+
 
 class DeviceTypePowerTest(APITestCase):
     """
@@ -4826,6 +5042,37 @@ class FeedsActionTest(APITestCase):
                 "source": "real",
             }],
         )
+
+    def test_feed_name_containing_markup_round_trips_as_plain_data(self):
+        """
+        Regression test for a stored-XSS pair the plugin's own JavaScript used
+        to be vulnerable to: the distribution legend (power_heatmap.js) and the
+        PDU bind-to-feed picker (editor/power.js) both concatenated a feed's
+        `name` straight into `innerHTML`. The actual fix is client-side
+        escaping (there is nothing to fix server-side -- a feed name IS
+        free-text, and this API's job is to report it faithfully), so this
+        test only pins the CONTRACT the JS fix relies on: the API must keep
+        returning the name byte-for-byte, unescaped and unrejected, so a
+        regression that started stripping or HTML-escaping it SERVER-SIDE
+        (silently defeating the point of the client-side fix, or breaking a
+        legitimately named feed) would be caught here.
+        """
+        self.add_permissions("netbox_rack_design.view_design")
+        rack = self.racks[0]
+        payload_name = '<img src=x onerror=alert(1)>Feed & "quoted"'
+
+        power_panel = PowerPanel.objects.create(site=self.site, name="Panel X")
+        PowerFeed.objects.create(
+            power_panel=power_panel, rack=rack, name=payload_name,
+            voltage=230, amperage=32, phase=PowerFeedPhaseChoices.PHASE_SINGLE,
+        )
+
+        response = self.client.get(
+            self._url() + f"?rack_id={rack.pk}", **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["real"]), 1)
+        self.assertEqual(response.data["real"][0]["name"], payload_name)
 
 
 class CopyFeedsActionTest(APITestCase):
@@ -6196,3 +6443,44 @@ class ApplyActionTest(APITestCase):
             response.data["problems"],
         )
         self.assertFalse(Device.objects.filter(name="apply-srv-1").exists())
+
+    def test_updating_an_existing_device_snapshots_before_writing(self):
+        """
+        Regression test: ``_execute()``'s ``updated``/``removed``/``reverted``
+        loops used to mutate a pre-existing Device with no ``.snapshot()``
+        call first (unlike ``signals.py``'s established pattern for
+        placements), so the resulting ``ObjectChange`` carried the new state
+        with no ``prechange_data`` to compare it against. Drives a real update
+        through the API (not a direct ``apply.run()`` call) so NetBox's own
+        change-logging request context is actually active.
+        """
+        self.add_permissions(
+            "netbox_rack_design.view_design", "netbox_rack_design.change_design",
+            "dcim.add_device", "dcim.change_device",
+        )
+        design = self._design_with_add("Snapshot check", position=10, name="snap-srv-1")
+        response = self.client.post(self._url(design), {}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        device_id = response.data["created"][0]["device"]
+
+        # Move the SAME placement's target position, forcing an "updated" entry.
+        placement = DesignPlacement.objects.get(design=design)
+        design.status = DesignStatusChoices.STATUS_DRAFT
+        design.save()
+        placement.target_position = 12
+        placement.save()
+        design.status = DesignStatusChoices.STATUS_APPROVED
+        design.save()
+
+        response = self.client.post(self._url(design), {}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["updated"]), 1, response.data)
+
+        device_type = ObjectType.objects.get_for_model(Device)
+        objectchange = ObjectChange.objects.filter(
+            changed_object_type=device_type, changed_object_id=device_id,
+            action=ObjectChangeActionChoices.ACTION_UPDATE,
+        ).latest("time")
+        self.assertObjectChange(objectchange, action=ObjectChangeActionChoices.ACTION_UPDATE)
+        self.assertEqual(objectchange.prechange_data["position"], "10.0")
+        self.assertEqual(objectchange.postchange_data["position"], "12.0")

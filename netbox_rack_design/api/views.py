@@ -4,7 +4,7 @@ import logging
 
 from dcim.models import Device, DeviceBay, DeviceRole, DeviceType, PowerFeed, Rack
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from netbox.api.authentication import TokenPermissions
 from netbox.api.viewsets import NetBoxModelViewSet
@@ -12,9 +12,11 @@ from netbox.plugins import get_plugin_config
 from rest_framework import status, views, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, PermissionDenied
-from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from tenancy.models import Tenant
+from users.models import Token
+from utilities.exceptions import PermissionsViolation
 
 from .. import apply as apply_engine
 from .. import filtersets, naming, planning_fields, projection, versioning
@@ -174,6 +176,44 @@ def _feed_dict(feed, source):
         "supply": getattr(feed.supply, "value", feed.supply),
         "source": source,
     }
+
+
+def _resolve_scoped_rack(user, design, rack_id):
+    """
+    Resolve a client-supplied ``rack_id`` for an action that reads a rack's
+    dcim content (power-source, feeds, copy-feeds, recompute-distribution).
+
+    Checked against the design's SITE only (matching the same-site rule
+    ``add_rack``/``copy_feeds`` already enforce for a rack joining a design's
+    scope) -- NOT against ``dcim.view_rack``. This plugin's own permissions
+    (``view_design``/``change_design``) are the complete, self-sufficient
+    boundary for reading dcim data a design touches or could touch; a
+    deployment routinely grants a planner ``change_design`` with no separate
+    dcim permissions at all; NOT narrowed to ``design.racks`` either:
+    ``power_source``/``copy_feeds`` deliberately read a SIBLING rack not yet
+    in scope (that is the whole point of "copy from rack"), so site is the
+    right boundary here, not scope membership.
+
+    Returns ``None`` when the rack does not exist or is outside the design's
+    site.
+    """
+    if not rack_id:
+        return None
+    return Rack.objects.filter(pk=rack_id, site_id=design.site_id).first()
+
+
+def _redacted_design_placeholder():
+    """
+    A stand-in for a Design the caller has no view permission on, shaped like
+    ``NestedDesignSerializer`` (``id``/``url``/``display``/``title``/
+    ``version``/``status``) so it can sit in the same list as real serialized
+    entries without a client-side type check. Used where a lineage (chain
+    ancestors) must stay the right LENGTH and ORDER even when one of its
+    designs is hidden -- unlike a child list, where a hidden entry can simply
+    be omitted.
+    """
+    return {"id": None, "url": None, "display": "(restricted design)",
+            "title": None, "version": None, "status": None}
 
 
 def _retarget_feed_name(name, source_rack_name, target_rack_name):
@@ -354,6 +394,23 @@ def _reject_frozen_design(design):
         {"detail": _frozen_design_rest_message(design)},
         status=status.HTTP_409_CONFLICT,
     )
+
+
+def _require_perms(user, *codenames, message):
+    """
+    Raise ``PermissionDenied`` unless ``user`` holds every one of ``codenames``
+    (blanket, model-level -- ``has_perm`` with no object, matching how every
+    caller below already checked ``add_designplacement`` et al. one at a
+    time). Factored out of ``save_layout`` so the same requirement is
+    trivial to add to its sibling design-level actions (``remove_rack``,
+    ``rerun_naming``, ``planned_feed``, ``copy_feeds``), which write the same
+    child models (``DesignPlacement``/``DesignPowerFeed``) but, unlike
+    ``save_layout``, used to check only ``change_design`` on the PARENT
+    design and nothing on the rows actually being written.
+    """
+    for codename in codenames:
+        if not user.has_perm(codename):
+            raise PermissionDenied(message)
 
 
 def _rerun_naming_plan(design, placement_ids):
@@ -765,10 +822,16 @@ class DesignViewSet(NetBoxModelViewSet):
         distributions = {}
         dist_status = {}
         powers = {}
+        # Resolved once here (same-site, like every other rack-by-id action in
+        # this file) and reused below, so the racks the expensive second loop
+        # projects are exactly the ones validated here -- never a second,
+        # unchecked Rack.objects.get(pk=...).
+        resolved_racks = {}
         with transaction.atomic():
             for rack_data in data["racks"]:
                 rack_id = rack_data["rack_id"]
-                rack = Rack.objects.filter(pk=rack_id).first()
+                rack = _resolve_scoped_rack(request.user, design, rack_id)
+                resolved_racks[rack_id] = rack
                 if rack is None:
                     distributions[str(rack_id)] = None
                     dist_status[str(rack_id)] = None
@@ -808,7 +871,7 @@ class DesignViewSet(NetBoxModelViewSet):
                     # asked for see a complete layout), but not projected. The
                     # caller keeps whatever numbers it already had for it.
                     continue
-                rack = Rack.objects.get(pk=rack_id)
+                rack = resolved_racks[rack_id]
                 elevation = projection.project_rack(design, rack)
                 distributions[str(rack_id)] = elevation.power.get("distribution")
                 dist_status[str(rack_id)] = elevation.power.get("distribution_status")
@@ -1013,6 +1076,11 @@ class DesignViewSet(NetBoxModelViewSet):
                 design=design, rack=rack
             )
             rack_power.power_config = power_config
+            try:
+                rack_power.full_clean()
+            except ValidationError as exc:
+                errors = exc.message_dict if hasattr(exc, "message_dict") else {"power_config": exc.messages}
+                return Response(errors, status=status.HTTP_400_BAD_REQUEST)
             rack_power.save()
             logger.debug(
                 "api.rack_power: design=%s rack_id=%s %s",
@@ -1084,14 +1152,31 @@ class DesignViewSet(NetBoxModelViewSet):
             self.queryset = Design.objects.restrict(request.user, perm)
         design = self.get_object()
 
-        if request.method == "POST":
-            result = apply_engine.run(design, request.user)
-            body = _serialize_apply_result(result)
-            code = status.HTTP_200_OK if result.ok else status.HTTP_409_CONFLICT
-            return Response(body, status=code)
+        # Defense in depth: plan()/run() report every KNOWN unworkable state as
+        # a problem string rather than raising (see plan()'s own bay-placement
+        # and chain-move handling), so this is a backstop for a genuinely
+        # unexpected failure (e.g. a concurrent-modification IntegrityError, or
+        # _execute()'s own PermissionsViolation when a write would move a
+        # device outside what the restricted post-save check allows), not the
+        # primary way problems are reported. Either method failing like this
+        # returns the same shape a refused apply already uses, rather than a
+        # bare 500.
+        try:
+            if request.method == "POST":
+                result = apply_engine.run(design, request.user)
+                body = _serialize_apply_result(result)
+                code = status.HTTP_200_OK if result.ok else status.HTTP_409_CONFLICT
+                return Response(body, status=code)
 
-        result = apply_engine.plan(design, request.user)
-        return Response(_serialize_apply_result(result), status=status.HTTP_200_OK)
+            result = apply_engine.plan(design, request.user)
+            return Response(_serialize_apply_result(result), status=status.HTTP_200_OK)
+        except (ValidationError, IntegrityError, PermissionsViolation) as exc:
+            logger.warning("api.apply: design=%s raised %r", design.pk, exc)
+            detail = "; ".join(exc.messages) if hasattr(exc, "messages") else str(exc)
+            return Response(
+                {"ok": False, "problems": [detail or "The apply could not be completed."]},
+                status=status.HTTP_409_CONFLICT,
+            )
 
     @action(detail=True, methods=["get"], url_path="power-source")
     def power_source(self, request, pk=None):
@@ -1133,7 +1218,7 @@ class DesignViewSet(NetBoxModelViewSet):
             )
 
         rack_id = request.query_params.get("rack_id")
-        rack = Rack.objects.filter(pk=rack_id).first() if rack_id else None
+        rack = _resolve_scoped_rack(request.user, design, rack_id)
         if rack is None:
             return Response(
                 {"rack_id": ["Rack does not exist."]},
@@ -1205,15 +1290,13 @@ class DesignViewSet(NetBoxModelViewSet):
         body.is_valid(raise_exception=True)
         data = body.validated_data
 
-        target = Rack.objects.filter(pk=data["rack_id"]).first()
+        # _resolve_scoped_rack enforces the same-site rule (mirroring add-rack
+        # / rack-power / planned-feed) for both racks.
+        target = _resolve_scoped_rack(request.user, design, data["rack_id"])
         if target is None:
             return Response({"rack_id": ["Rack does not exist."]},
                             status=status.HTTP_400_BAD_REQUEST)
-        # Same-site rule, mirroring add-rack / rack-power / planned-feed.
-        if target.site_id != design.site_id:
-            return Response({"rack_id": ["This rack is not in the design's site."]},
-                            status=status.HTTP_400_BAD_REQUEST)
-        source = Rack.objects.filter(pk=data["source_rack_id"]).first()
+        source = _resolve_scoped_rack(request.user, design, data["source_rack_id"])
         if source is None:
             return Response({"source_rack_id": ["Rack does not exist."]},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -1332,19 +1415,26 @@ class DesignViewSet(NetBoxModelViewSet):
                 {"rack_id": ["This query parameter is required."]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        logger.debug("api.feeds: design=%s rack_id=%s", design.pk, rack_id)
+        rack = _resolve_scoped_rack(request.user, design, rack_id)
+        if rack is None:
+            return Response(
+                {"rack_id": ["Rack does not exist."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        logger.debug("api.feeds: design=%s rack_id=%s", design.pk, rack.pk)
 
         real_feeds = [
-            _feed_dict(f, "real") for f in PowerFeed.objects.filter(rack_id=rack_id)
+            _feed_dict(f, "real")
+            for f in PowerFeed.objects.filter(rack=rack)
         ]
         planned_feeds = [
             _feed_dict(f, "planned")
-            for f in DesignPowerFeed.objects.filter(design=design, rack_id=rack_id)
+            for f in DesignPowerFeed.objects.filter(design=design, rack=rack)
         ]
         chain, _refusal = projection.resolve_baseline_chain(design)
         for ancestor in chain:
             for f in DesignPowerFeed.objects.filter(
-                design=ancestor, rack_id=rack_id
+                design=ancestor, rack=rack
             ):
                 entry = _feed_dict(f, "planned")
                 entry["inherited"] = True
@@ -1490,15 +1580,13 @@ class DesignViewSet(NetBoxModelViewSet):
         design = self.get_object()
 
         # Additionally require placement add/change/delete on this design's edits.
-        for codename in (
+        _require_perms(
+            request.user,
             "netbox_rack_design.add_designplacement",
             "netbox_rack_design.change_designplacement",
             "netbox_rack_design.delete_designplacement",
-        ):
-            if not request.user.has_perm(codename):
-                raise PermissionDenied(
-                    "This user does not have permission to modify design placements."
-                )
+            message="This user does not have permission to modify design placements.",
+        )
 
         # Frozen check BEFORE any reconciliation starts (PLAN-design-chains.md
         # §2.2/G4): an approved design's placements are read-only, and the
@@ -2434,25 +2522,54 @@ class DesignViewSet(NetBoxModelViewSet):
             # (below) reports the SAME break as ``refusal``; this just avoids
             # crashing the endpoint that displays it.
             ancestors = []
-        children = list(design.children)
         _, refusal = projection.resolve_baseline_chain(design)
 
+        # baseline_chain()/children/refusal["source_design"] are resolved via
+        # raw FK/reverse-FK traversal with no view-permission check (unlike
+        # `design` itself, restricted above) -- an ancestor, child or refusal
+        # source the caller cannot view would otherwise be fully exposed
+        # (title, comments, custom fields via a later detail fetch) just by
+        # sharing a chain with a design the caller CAN see. Ancestors are
+        # redacted in place (a hidden ancestor still needs to occupy its slot
+        # so the chain's length/order/"where it breaks" stays meaningful);
+        # children are simply dropped, since there is no ordering to preserve.
+        visible_ids = set(
+            Design.objects.restrict(request.user, "view")
+            .filter(pk__in=[a.pk for a in ancestors])
+            .values_list("pk", flat=True)
+        )
+        children = list(design.children.restrict(request.user, "view"))
+
         context = {"request": request}
+        ancestors_data = [
+            NestedDesignSerializer(a, context=context).data if a.pk in visible_ids
+            else _redacted_design_placeholder()
+            for a in ancestors
+        ]
+
         refusal_data = None
         if refusal is not None:
+            source_design = refusal["source_design"]
+            source_visible = (
+                source_design is not None
+                and Design.objects.restrict(request.user, "view")
+                .filter(pk=source_design.pk).exists()
+            )
             refusal_data = {
                 "kind": refusal["kind"],
                 "severity": refusal["severity"],
-                "detail": refusal["detail"],
+                "detail": refusal["detail"] if source_visible else (
+                    "The chain is broken by a design you do not have permission to view."
+                ),
                 "source_design": (
-                    NestedDesignSerializer(refusal["source_design"], context=context).data
-                    if refusal["source_design"] is not None else None
+                    NestedDesignSerializer(source_design, context=context).data
+                    if source_visible else None
                 ),
             }
 
         return Response(
             {
-                "ancestors": NestedDesignSerializer(ancestors, many=True, context=context).data,
+                "ancestors": ancestors_data,
                 "children": NestedDesignSerializer(children, many=True, context=context).data,
                 "resolves": refusal is None,
                 "refusal": refusal_data,
@@ -2548,7 +2665,12 @@ class DesignViewSet(NetBoxModelViewSet):
         # Restrict by "add" (not "view"): the required permission for this
         # action IS add_design (it creates a Design), matching how add_rack /
         # remove_rack restrict by "change" -- the permission the action
-        # actually needs, not a stricter or looser one.
+        # actually needs, not a stricter or looser one. This plugin
+        # deliberately treats an APPROVED design as readable/clonable by
+        # anyone who may create designs at all (see test_derive_from_
+        # approved_parent_succeeds): approval is what makes a baseline
+        # trustworthy to build on, and is itself the disclosure boundary here,
+        # not a separate view_design grant on the specific parent.
         if request.user.is_authenticated:
             self.queryset = Design.objects.restrict(request.user, "add")
         design = self.get_object()
@@ -2632,7 +2754,9 @@ class DesignViewSet(NetBoxModelViewSet):
         Path:     /api/plugins/rack-design/designs/<pk>/new-version/
         """
         # Restrict by "add" (not "view"): the required permission for this
-        # action IS add_design (it creates a Design), matching `derive`.
+        # action IS add_design (it creates a Design), matching `derive` above
+        # -- same rationale: an approved design is readable/clonable by
+        # anyone who may create designs at all.
         if request.user.is_authenticated:
             self.queryset = Design.objects.restrict(request.user, "add")
         design = self.get_object()
@@ -2705,6 +2829,11 @@ class DesignViewSet(NetBoxModelViewSet):
             )
 
         previous_based_on_id = design.based_on_id
+        # Snapshot before mutating, matching the pattern signals.py already
+        # uses for placements: without it, this design's changelog entry
+        # would record the new based_on with no prechange_data to compare it
+        # against.
+        design.snapshot()
         design.based_on = target
         try:
             design.full_clean()
@@ -2785,6 +2914,32 @@ class DesignPowerFeedViewSet(NetBoxModelViewSet):
             exc.status_code = status.HTTP_409_CONFLICT
             raise exc
         super().perform_destroy(instance)
+
+
+class _TokenWriteRequired(BasePermission):
+    """
+    Refuse an unsafe request made with a read-only API token.
+
+    The custom ``ViewSet``s below (favorites, hidden-rack/chassis toggles,
+    device-type power lookup, the placement-fields schema) use plain
+    ``IsAuthenticated`` rather than a ``NetBoxModelViewSet``, so none of them
+    go through ``TokenPermissions`` -- the class that normally checks
+    ``Token.write_enabled`` for a POST/PATCH/DELETE. NetBox's own
+    ``TokenWritePermission`` cannot be reused as-is here: it REQUIRES token
+    auth and rejects session auth outright (users/api/authentication.py),
+    which would break every session-authenticated browser user of these
+    endpoints. This instead only checks write_enabled when the request is
+    BOTH unsafe AND actually token-authenticated, and is meant to be combined
+    with ``IsAuthenticated`` (not used alone), so it never has to answer "is
+    this user allowed here at all" -- only "may a read-only token write".
+    """
+
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        if not isinstance(request.auth, Token):
+            return True
+        return bool(request.auth.write_enabled)
 
 
 class _HasViewDesignPermission(BasePermission):
@@ -2880,7 +3035,7 @@ class FavoriteSetViewSet(viewsets.ViewSet):
     has a set to work in.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     @staticmethod
     def _serialize(fav_set, members):
@@ -2981,7 +3136,7 @@ class FavoriteDeviceTypeViewSet(viewsets.ViewSet):
       POST /api/plugins/rack-design/favorite-device-types/toggle/ -> star/unstar
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     @staticmethod
     def _resolve_set(user, raw_set_id):
@@ -3073,7 +3228,7 @@ class DeviceTypePowerViewSet(viewsets.ViewSet):
         -> {"results": {"1": {"draw_w", "draw_known", "power_ports": [...]}, ...}}
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     def list(self, request):
         """Return per-id power summaries for the requested device-type ids."""
@@ -3116,7 +3271,7 @@ class HiddenDesignChassisViewSet(viewsets.ViewSet):
            body {"design_id", "chassis_id"}
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     def _hidden_ids(self, user, design_id):
         return list(
@@ -3183,7 +3338,7 @@ class HiddenDesignRackViewSet(viewsets.ViewSet):
            body {"design_id"} -> clear all hidden rows for the design
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     def _hidden_ids(self, user, design_id):
         return list(
@@ -3270,7 +3425,7 @@ class PlacementFieldsView(views.APIView):
     contract.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, _TokenWriteRequired]
 
     def get(self, request):
         return Response(planning_fields.public_placement_field_schema())

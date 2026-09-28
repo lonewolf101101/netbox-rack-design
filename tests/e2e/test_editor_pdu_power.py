@@ -360,6 +360,53 @@ class EditorPduPowerTestCase(unittest.TestCase):
         self.real_feed_id = res["realFeedId"]
         self.assertEqual(self.errors, [], f"console errors: {self.errors}")
 
+    def test_bind_dialog_escapes_a_feed_name_containing_markup(self):
+        """
+        Regression test for a stored-XSS bug: the bind-to-feed picker used to
+        concatenate a feed's ``name`` straight into ``innerHTML`` (editor/
+        power.js's ``renderList``), unescaped -- a feed named
+        ``<img src=x onerror=...>`` ran its handler the instant this dialog
+        opened, for any user who dropped a PDU onto the rack. The fix is a
+        shared ``escapeHtml`` helper at every such call site; this proves the
+        payload now renders as inert TEXT (no ``<img>`` element is created,
+        the handler never fires) rather than being parsed as markup.
+        """
+        suffix = uuid.uuid4().hex[:6]
+        payload_name = f'<img src=x onerror="window.__rd_e2e_xss_{suffix}=1">Feed{suffix}'
+        panel = self._created["panel"]
+        feed = self._api("POST", "/api/dcim/power-feeds/", {
+            "power_panel": panel, "rack": self._rack_id,
+            "name": payload_name, "status": "active",
+            "voltage": 230, "amperage": 16, "phase": "single-phase", "supply": "ac",
+        })
+        try:
+            res = self.page.evaluate("""async ([RID, marker]) => {
+                const api = window.NbxRdEditor;
+                const widget = { proposed_name: 'e2e-pp-pdu-xss', role_slug: 'pdu', label: 'e2e-pp-pdu-xss' };
+                const content = document.createElement('div');
+                api.showPduPowerDialog(widget, content, {rackId: String(RID)});
+                for (let i = 0; i < 20; i++) {
+                    await new Promise(r => setTimeout(r, 100));
+                    if (document.querySelector('.nbx-rd-feed-list input[name=nbx-rd-feed-pick]')) { break; }
+                }
+                const list = document.querySelector('.nbx-rd-feed-list');
+                const result = {
+                    xssFired: !!window[marker],
+                    imgElementCreated: !!(list && list.querySelector('img')),
+                    labelText: list ? list.textContent : null,
+                };
+                document.querySelectorAll('.modal button').forEach(
+                    b => { if (/cancel/i.test(b.textContent)) b.click(); });
+                return result;
+            }""", [self._rack_id, f"__rd_e2e_xss_{suffix}"])
+        finally:
+            self._api("DELETE", f"/api/dcim/power-feeds/{feed['id']}/")
+
+        self.assertFalse(res["xssFired"], res)
+        self.assertFalse(res["imgElementCreated"], res)
+        self.assertIn(payload_name, res["labelText"] or "", res)
+        self.assertEqual(self.errors, [], f"console errors: {self.errors}")
+
     def test_bind_dialog_defines_and_picks_planned_feed(self):
         """The greenfield 'define planned feed' fallback: fill the inline form,
         Create posts planned-feed/ (upsert), the new feed appears in the list

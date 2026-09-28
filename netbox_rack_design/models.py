@@ -64,6 +64,24 @@ def _frozen_design_clean_message(what):
     )
 
 
+def _power_config_custom_fields(power_config):
+    """
+    The ``custom_fields`` dict out of a ``power_config``/``DesignRackPower``
+    JSON value, defensively: ``power_config`` is stored as-is with no
+    database-level shape constraint, so a row written before shape validation
+    existed (or by a direct script write that skips ``full_clean()``) can
+    still hold a non-dict value. A bare ``(power_config or {}).get(...)``
+    crashes on any such value that is truthy but not a dict (e.g. a JSON
+    list) -- this is the one place every reader of a stored ``power_config``
+    should go through, rather than repeating the isinstance guard at each
+    call site.
+    """
+    if not isinstance(power_config, dict):
+        return {}
+    custom_fields = power_config.get("custom_fields")
+    return custom_fields if isinstance(custom_fields, dict) else {}
+
+
 class DesignGroup(NetBoxModel):
     """
     An optional, hierarchical container that links designs into a larger effort
@@ -339,26 +357,93 @@ class Design(NetBoxModel):
                               "design's site."}
             )
 
+        # A design's whole placement layer is replayed into anything based on
+        # it (projection.resolve_baseline_chain), so the parent must already
+        # be a trustworthy, frozen baseline -- exactly the rule `derive`
+        # enforces for the sibling "create a child" flow. Without this, a
+        # `based_on` pointed at a draft (still being edited, and until now
+        # never permission-checked at the view layer either -- see the REST
+        # `rebase` action and DesignRebaseForm's queryset) let a design's
+        # in-progress content leak into another design's editor/projection.
+        if self.based_on_id and self.based_on.status != DesignStatusChoices.STATUS_APPROVED:
+            raise ValidationError(
+                {"based_on": f"Only an approved design may be a base "
+                             f"(PLAN-design-chains.md §2.2). {self.based_on} is "
+                             f"{self.based_on.get_status_display().lower()}."}
+            )
+
         # depends_on cycle guard (G7): a many-to-many relation cannot be read on
         # an unsaved instance (pk=None) -- Django raises before the through-rows
         # exist -- so, mirroring the ``racks`` check below, this only runs once
         # the design is persisted (i.e. on edits; a brand-new design has no
         # dependents attached yet to form a cycle with).
         if self.pk:
-            # DFS tracking the current recursion path's pks (not a flat "seen"
-            # set collected across branches) so a revisit within ONE path is a
-            # real cycle, an unrelated diamond (A depends on B and C, both
-            # depending on D) is not mistaken for one, and a cycle that does
-            # not happen to pass back through self (but is reachable from it)
-            # still terminates instead of recursing forever.
-            def _walk(node, path):
-                if node.pk in {p.pk for p in path}:
-                    chain = " -> ".join(str(d) for d in [*path, node])
-                    raise ValidationError({"depends_on": f"Cycle in 'depends_on': {chain}"})
-                for nxt in node.depends_on.all():
-                    _walk(nxt, [*path, node])
+            # Iterative colour-marking DFS (white/grey/black) over the WHOLE
+            # graph's edges, loaded once, rather than the naive "recurse and
+            # re-walk every path" version this replaced: that one re-issued a
+            # query per visit and never remembered a node it had already
+            # cleared, so a diamond-shaped graph (common: several designs all
+            # depending on one shared prerequisite) made it revisit the same
+            # subtree once per path into it -- exponential in the graph's
+            # depth for a layered "everyone depends on two things" shape, with
+            # no cap, so a user able to create designs and edit their own
+            # depends_on could build a graph that pins a worker on this single
+            # validation. This version is O(V+E): one query loads every
+            # (from, to) edge in the graph reachable from `self` via a single
+            # SQL join per BFS layer (not per node), and each node is
+            # colour-marked once. A cycle is a grey node reached again while
+            # still on the current DFS stack, exactly as before -- a diamond
+            # (both branches reaching a common, already-cleared/"black" node)
+            # is not mistaken for one.
+            through = type(self).depends_on.through
+            from_field, to_field = "from_design_id", "to_design_id"
+            edges = {}  # node pk -> [neighbour pks]
+            frontier = {self.pk}
+            seen_nodes = {self.pk}
+            while frontier:
+                rows = through.objects.filter(**{f"{from_field}__in": frontier}).values_list(
+                    from_field, to_field
+                )
+                next_frontier = set()
+                for src, dst in rows:
+                    edges.setdefault(src, []).append(dst)
+                    if dst not in seen_nodes:
+                        seen_nodes.add(dst)
+                        next_frontier.add(dst)
+                frontier = next_frontier
 
-            _walk(self, [])
+            WHITE, GREY, BLACK = 0, 1, 2
+            colour = dict.fromkeys(seen_nodes, WHITE)
+            # One bulk fetch for every node reached, purely for the human-
+            # readable cycle message below -- the walk above never needed the
+            # Design instances themselves, only their pks and edges.
+            id_to_design = {self.pk: self}
+            id_to_design.update(
+                Design.objects.in_bulk(seen_nodes - {self.pk})
+            )
+            # DFS via an explicit stack of (node, neighbour-iterator, path-so-far)
+            # frames, not Python recursion -- a pathological chain (A->B->C->...)
+            # could otherwise exhaust the call stack instead of raising cleanly.
+            stack = [(self.pk, iter(edges.get(self.pk, [])), [self.pk])]
+            colour[self.pk] = GREY
+            while stack:
+                node_pk, neighbours, path = stack[-1]
+                advanced = False
+                for nxt_pk in neighbours:
+                    if colour.get(nxt_pk, WHITE) == GREY:
+                        chain_pks = [*path, nxt_pk]
+                        chain = " -> ".join(
+                            str(id_to_design.get(pk, pk)) for pk in chain_pks
+                        )
+                        raise ValidationError({"depends_on": f"Cycle in 'depends_on': {chain}"})
+                    if colour.get(nxt_pk, WHITE) == WHITE:
+                        colour[nxt_pk] = GREY
+                        stack.append((nxt_pk, iter(edges.get(nxt_pk, [])), [*path, nxt_pk]))
+                        advanced = True
+                        break
+                if not advanced:
+                    colour[node_pk] = BLACK
+                    stack.pop()
 
         # At most one approved version per plan (root group). A brand-new, unsaved
         # root (pk=None, root=None) has no persisted version group yet, so there is
@@ -402,15 +487,25 @@ class Design(NetBoxModel):
                     )
 
         # Every scoped rack must belong to this design's site (consistent with the
-        # site-scoping of placements). M2M-timing caveat: a many-to-many relation
-        # cannot be read on an unsaved instance (pk=None) -- Django raises before
-        # the through-rows exist -- so this check only runs once the design is
-        # persisted (i.e. on edits). For a brand-new design the racks are attached
-        # only after the initial save, so the form/serializer layer (a later phase)
-        # must re-run full_clean() post-save to enforce this on create.
-        if self.pk and self.site_id:
-            offending = self.racks.exclude(site_id=self.site_id)
-            if offending.exists():
+        # site-scoping of placements). Checks the INCOMING racks when there are
+        # any (``_m2m_values``, the same attribute the frozen-racks check below
+        # already reads) rather than only the persisted ``self.racks`` --
+        # NetBox's REST serializer layer pops M2M fields into
+        # ``instance._m2m_values`` and calls ``full_clean()`` BEFORE saving
+        # them, so a create or update checked only against the persisted value
+        # would validate the OLD scope while a cross-site rack sailed through
+        # in the request body. Falls back to the persisted M2M (still gated on
+        # ``self.pk``, since it cannot be read pre-save) only when the request
+        # did not touch ``racks`` at all.
+        new_racks = getattr(self, "_m2m_values", {}).get("racks")
+        if self.site_id:
+            if new_racks is not None:
+                offending = [r for r in new_racks if r.site_id != self.site_id]
+            elif self.pk:
+                offending = list(self.racks.exclude(site_id=self.site_id))
+            else:
+                offending = []
+            if offending:
                 names = ", ".join(str(rack) for rack in offending)
                 raise ValidationError(
                     {"racks": f"These racks are not in the design's site: {names}."}
@@ -853,6 +948,21 @@ class DesignPlacement(NetBoxModel):
         if self.design_id and self.design.is_frozen:
             raise ValidationError(_frozen_design_clean_message("its placements"))
 
+        # The check above only inspects the NEW design being written to --
+        # not the row's ORIGINAL, persisted design. Without this, a user
+        # holding change_designplacement (not necessarily change_design on
+        # the approved design itself) could PATCH an existing placement's
+        # `design` FK to move it OUT of an approved design into one of their
+        # own drafts: the check above sees only the draft (not frozen) and
+        # lets it through, silently shrinking the approved plan's content
+        # with no error. Reusing Design.clean()'s own refetch-by-pk pattern.
+        if self.pk:
+            was_in_approved = DesignPlacement.objects.filter(
+                pk=self.pk, design__status=DesignStatusChoices.STATUS_APPROVED,
+            ).exclude(design_id=self.design_id).exists()
+            if was_in_approved:
+                raise ValidationError(_frozen_design_clean_message("its placements"))
+
         # Config-declared planning fields: validated against the deployment's
         # ``placement_fields`` schema and normalised in place, so what reaches
         # the database is always type-correct and free of keys nothing reads.
@@ -869,6 +979,23 @@ class DesignPlacement(NetBoxModel):
         # design's point of view (§9.2), same as base_placement.
         if self.planned_power_feed_id:
             self._validate_planned_power_feed()
+
+        # Shape-validated the same way planning_data is (planning_fields.py):
+        # power_config is stored as-is with no isinstance check today, so a
+        # non-dict value (a JSON list, a bare string) passes clean() untouched
+        # and later crashes the distribution engine -- for every subsequent
+        # viewer of the rack, not just this request -- the first time
+        # something reads `power_config.get(...)` on it. Checked here, before
+        # the `.get("custom_fields")` call two lines below, which would
+        # otherwise be the first (and, for a non-dict, crashing) read.
+        if self.power_config is not None and not isinstance(self.power_config, dict):
+            raise ValidationError({"power_config": "power_config must be an object."})
+        if isinstance(self.power_config, dict) and "custom_fields" in self.power_config:
+            custom_fields = self.power_config["custom_fields"]
+            if custom_fields is not None and not isinstance(custom_fields, dict):
+                raise ValidationError(
+                    {"power_config": "power_config.custom_fields must be an object."}
+                )
 
         # A planned PDU's custom fields come from at most ONE source: a referenced
         # real device (cf read live) OR manual power_config -- never both (docs/
@@ -1687,6 +1814,17 @@ class DesignPowerFeed(NetBoxModel):
         if self.design_id and self.design.is_frozen:
             raise ValidationError(_frozen_design_clean_message("its planned power feeds"))
 
+        # Same re-parenting gap as DesignPlacement.clean() above: the check
+        # just above only inspects the NEW design, so PATCHing `design` on an
+        # existing planned feed out of an approved design and into a draft
+        # would otherwise silently change the approved plan's rack capacity.
+        if self.pk:
+            was_in_approved = DesignPowerFeed.objects.filter(
+                pk=self.pk, design__status=DesignStatusChoices.STATUS_APPROVED,
+            ).exclude(design_id=self.design_id).exists()
+            if was_in_approved:
+                raise ValidationError(_frozen_design_clean_message("its planned power feeds"))
+
     @property
     def derated_watts(self):
         """The usable watts this feed contributes to its rack's capacity.
@@ -1786,14 +1924,29 @@ class DesignRackPower(models.Model):
                 row = cls.objects.get(design=ancestor, rack=rack)
             except cls.DoesNotExist:
                 continue
-            merged.update((row.power_config or {}).get("custom_fields") or {})
+            merged.update(_power_config_custom_fields(row.power_config))
         try:
             own = cls.objects.get(design=design, rack=rack)
         except cls.DoesNotExist:
             own = None
         if own is not None:
-            merged.update((own.power_config or {}).get("custom_fields") or {})
+            merged.update(_power_config_custom_fields(own.power_config))
         return merged, conflict
+
+    def clean(self):
+        super().clean()
+        # Same shape validation as DesignPlacement.power_config (models.py):
+        # stored as-is with no isinstance check otherwise, a non-dict value
+        # passes silently and later crashes effective_custom_fields() (above)
+        # for every subsequent viewer of the rack.
+        if self.power_config is not None and not isinstance(self.power_config, dict):
+            raise ValidationError({"power_config": "power_config must be an object."})
+        if isinstance(self.power_config, dict) and "custom_fields" in self.power_config:
+            custom_fields = self.power_config["custom_fields"]
+            if custom_fields is not None and not isinstance(custom_fields, dict):
+                raise ValidationError(
+                    {"power_config": "power_config.custom_fields must be an object."}
+                )
 
 
 class DesignApply(models.Model):

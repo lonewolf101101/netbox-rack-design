@@ -12,7 +12,7 @@
   <a href="https://www.youtube.com/playlist?list=PLQrzYAZqdcXg"><b>▶ Full 10-part tutorial</b></a>
 </p>
 
-NetBox Rack Design adds a lightweight *design layer* to NetBox for planning device adds, moves, and removals in your racks. A **Design** is a named, versioned proposal that overlays your live DCIM data: your real `dcim.Device` and `dcim.Rack` records stay untouched, and each planned change — add, move, or remove — is captured as a structured **placement** instead of a spreadsheet cell. This brings the *intended* rack layout into NetBox and renders it as a projected rack elevation, with power projection, an auto-naming engine, design chains (baselining one design on another approved one), and an explicit Apply step already built in.
+NetBox Rack Design adds a lightweight _design layer_ to NetBox for planning device adds, moves, and removals in your racks. A **Design** is a named, versioned proposal that overlays your live DCIM data: your real `dcim.Device` and `dcim.Rack` records stay untouched, and each planned change — add, move, or remove — is captured as a structured **placement** instead of a spreadsheet cell. This brings the _intended_ rack layout into NetBox and renders it as a projected rack elevation, with power projection, an auto-naming engine, design chains (baselining one design on another approved one), and an explicit Apply step already built in.
 
 The plugin is fully generic and public — nothing organization-specific is hardcoded. Status names and behavior are driven entirely by `PLUGINS_CONFIG`, and only native NetBox mechanisms are used (change logging, tags, custom fields, permissions, REST + GraphQL APIs, global search).
 
@@ -21,16 +21,16 @@ The plugin is fully generic and public — nothing organization-specific is hard
 Rack Design pairs a structured data model with an interactive visual editor for composing rack plans. Applying a design into NetBox, conflict detection within a design chain, and conflict detection between two unrelated designs planning the same rack are all delivered (see [Roadmap](#roadmap)).
 
 - **Three models** for capturing rack plans:
-  - **Design** — a proposed set of rack changes for a site, scoped to one or more racks. Versioned (clone-and-tweak, with one approved version per plan), ordered for execution per site via an auto-assigned `sequence`, may declare explicit `depends_on` relationships, may optionally belong to a group, and may be **`based_on`** exactly one other approved design — forming a design chain (see [docs/design-chains.md](docs/design-chains.md)). Carries `title`, `status`, `summary`, generic external `link`, plus description/comments/tags/custom fields.
-  - **DesignGroup** — an optional, hierarchical container that links related designs into a larger effort (multi-stage work or cross-site coordination). Purely organizational; never affects execution order.
-  - **DesignPlacement** — a single proposed change within a design: **add** a new device from the device-type catalog (with an intended role and tenant), **move** an existing device, or **remove** (planned) one. Target slots are validated against NetBox's own `Rack.get_available_units()` collision logic. Real devices are never mutated.
+    - **Design** — a proposed set of rack changes for a site, scoped to one or more racks. Versioned (clone-and-tweak, with one approved version per plan), ordered for execution per site via an auto-assigned `sequence`, may declare explicit `depends_on` relationships, may optionally belong to a group, and may be **`based_on`** exactly one other approved design — forming a design chain (see [docs/design-chains.md](docs/design-chains.md)). Carries `title`, `status`, `summary`, generic external `link`, plus description/comments/tags/custom fields.
+    - **DesignGroup** — an optional, hierarchical container that links related designs into a larger effort (multi-stage work or cross-site coordination). Purely organizational; never affects execution order.
+    - **DesignPlacement** — a single proposed change within a design: **add** a new device from the device-type catalog (with an intended role and tenant), **move** an existing device, or **remove** (planned) one. Target slots are validated against NetBox's own `Rack.get_available_units()` collision logic. Real devices are never mutated.
 - **Interactive multi-rack visual editor** — a GridStack drag-and-drop editor that renders all of a design's racks side by side, across both front and rear faces, for composing adds/moves/removes. Includes a searchable **device-type catalog palette**, **per-user favorite device types** for quick access, and **per-user rack visibility** to focus the workspace. Every edit writes placements only — live devices are never touched.
-- **Projected rack elevations** — a read-only elevation view showing how a design's racks *would* look once applied (all racks, both faces, full-depth devices rendered across both faces), plus a filterable elevations list.
+- **Projected rack elevations** — a read-only elevation view showing how a design's racks _would_ look once applied (all racks, both faces, full-depth devices rendered across both faces), plus a filterable elevations list.
 - **Rack-page integration** — an optional panel on the core `dcim.rack` detail page listing the designs that touch that rack, each linking to its editor and elevation.
 - **Config-driven statuses** — which device statuses count as "planned" and which mark a planned removal are read from `PLUGINS_CONFIG`, never hardcoded.
 - **Naming convention engine** — auto-names planned devices via `naming_mode` = `sequence` / `template` / `script` (a dotted-path callable), with graceful fallback when a template or script fails. See [docs/device-naming.md](docs/device-naming.md).
 - **Power projection & PDU distribution** — a read-only power overlay: a per-rack capacity-vs-projected-consumption bar plus a per-device power heatmap, and per-PDU/per-bank power distribution (`distribution_mode` = `none` / `builtin` / `script`) with planned-PDU feed binding. See [docs/power-projection-spec.md](docs/power-projection-spec.md), [docs/power-distribution.md](docs/power-distribution.md), and [docs/pdu-distribution-spec.md](docs/pdu-distribution-spec.md).
-- **Apply a design** — materialize an approved design in NetBox as *planned* devices: each target slot is
+- **Apply a design** — materialize an approved design in NetBox as _planned_ devices: each target slot is
   reserved so nobody else can take it, planned cabling has real ports to attach to, and removals are flagged
   with a configured status. Safe to press twice (it reconciles rather than duplicating), all-or-nothing in one
   transaction, ordered along a chain, and run entirely with your own DCIM permissions. Available as a button and
@@ -65,28 +65,29 @@ vacated a slot.
 
 ![Device hover card showing a tile's details and a ghost's provenance](docs/assets/screenshots/13-device-hover-card.png)
 
-| | |
-|---|---|
-| ![Designs list](docs/assets/screenshots/01-designs-list.png) | ![Placement states: add, move, ghost, remove](docs/assets/screenshots/10-states-r102.png) |
-| _Designs list — versioned plans, scoped to one or more racks._ | _Placement states: planned add, move-in, move-out ghost, and flagged removal._ |
-| ![Unconnected-device warning](docs/assets/screenshots/06-warning-hover-heatmap.png) | ![Bind PDU to a power feed](docs/assets/screenshots/04-bind-feed-dialog.png) |
-| _Hover the ⚠ to see which powered devices aren't cabled yet._ | _Bind a planned PDU to a real or planned power feed._ |
+|                                                                                     |                                                                                           |
+| ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| ![Designs list](docs/assets/screenshots/01-designs-list.png)                        | ![Placement states: add, move, ghost, remove](docs/assets/screenshots/10-states-r102.png) |
+| _Designs list — versioned plans, scoped to one or more racks._                      | _Placement states: planned add, move-in, move-out ghost, and flagged removal._            |
+| ![Unconnected-device warning](docs/assets/screenshots/06-warning-hover-heatmap.png) | ![Bind PDU to a power feed](docs/assets/screenshots/04-bind-feed-dialog.png)              |
+| _Hover the ⚠ to see which powered devices aren't cabled yet._                       | _Bind a planned PDU to a real or planned power feed._                                     |
 
 More in the [documentation](https://ravenrs.github.io/netbox-rack-design/).
 
 ## Compatibility
 
-| Plugin Version | Minimum NetBox Version | Maximum NetBox Version | Python    |
-|----------------|------------------------|------------------------|-----------|
-| 0.17.x         | 4.4.0                  | 4.6.99                 | 3.12+     |
-| 0.16.0         | 4.4.0                  | 4.6.99                 | 3.12+     |
-| 0.15.x         | 4.4.0                  | 4.4.99                 | 3.12+     |
+| Plugin Version | Minimum NetBox Version | Maximum NetBox Version | Python |
+| -------------- | ---------------------- | ---------------------- | ------ |
+| 0.33.x         | 4.4.0                  | 4.7.99                 | 3.12+  |
+| 0.17.x         | 4.4.0                  | 4.6.99                 | 3.12+  |
+| 0.16.0         | 4.4.0                  | 4.6.99                 | 3.12+  |
+| 0.15.x         | 4.4.0                  | 4.4.99                 | 3.12+  |
 
 The supported NetBox range is enforced at load time via the plugin's `min_version` / `max_version`. See [COMPATIBILITY.md](https://github.com/ravenrs/netbox-rack-design/blob/main/COMPATIBILITY.md) for the full per-version matrix.
 
 ## Dependencies
 
-- **NetBox** 4.4.0 – 4.6.99 (tested against 4.4.8, 4.5.10 and 4.6.8)
+- **NetBox** 4.4.0 – 4.7.99 (tested against 4.4.8, 4.5.10, 4.6.8 and 4.7.1)
 - **Python** 3.12 or later
 
 No additional Python packages are required beyond NetBox's own dependencies.
@@ -122,7 +123,7 @@ PLUGINS_CONFIG = {
 
 > **Note on `removal_status`.** The default `decommissioning` is the only native
 > removal-oriented device status on a vanilla install. If `decommissioning` is
-> *destructive* in your environment (e.g. it auto-deletes devices or triggers an
+> _destructive_ in your environment (e.g. it auto-deletes devices or triggers an
 > external dismantle workflow), do **not** use it for planned removals. Instead add a
 > safe custom status via NetBox's `FIELD_CHOICES` (for `dcim.Device.status`, e.g.
 > `to_decommission`) and point `removal_status` at it.
@@ -173,25 +174,25 @@ migration if you need to step back.
 
 All settings are optional and configured under the `netbox_rack_design` key in `PLUGINS_CONFIG`.
 
-| Key                 | Default              | Description                                                                                                  |
-|---------------------|----------------------|--------------------------------------------------------------------------------------------------------------|
-| `planned_status`    | `"planned"`          | The device status the plugin treats as "planned".                                                             |
-| `removal_status`    | `"decommissioning"`  | The device status that marks a planned removal. Override with a safe custom status where `decommissioning` is destructive (see note above). |
-| `default_status`    | `"draft"`            | Default lifecycle status for a new Design.                                                                    |
-| `enable_rack_panel` | `True`               | Show the rack-page panel listing designs that touch a rack.                                                  |
-| `naming_mode`       | `"sequence"`         | How a placement's proposed name is computed: `"sequence"` (`<design title>-<n>`), `"template"` (a `str.format` template over real model objects), or `"script"` (a dotted path to `fn(placement) -> str`). See [docs/device-naming.md](docs/device-naming.md). |
-| `naming_template`   | `"{design.name}-{n}"`| Template used when `naming_mode == "template"`. Dotted attribute paths on the real Design/Device objects; `{design.name}` aliases the design title. |
-| `naming_script`     | `""`                 | Dotted path to a callable used when `naming_mode == "script"`.                                                |
-| `naming`            | `{}`                 | Reserved for future per-design naming options. No options are currently defined. |
-| `distribution_mode` | `"none"`             | How per-PDU/bank load is distributed for the power heatmap: `"none"` (per-rack total only, per-device gradient), `"builtin"` (native distribution from bank = outlet port name segment + feed-leg = bound feed, zero config), or `"script"` (a dotted path to `fn(rack, devices) -> Distribution` dict). See [docs/pdu-distribution-spec.md](docs/pdu-distribution-spec.md). |
-| `distribution_script` | `""`               | Dotted path to a callable used when `distribution_mode == "script"`.                                          |
-| `planning_fields`   | `{}`                 | Custom-field bridge mapping site custom fields into the rack/PDU planning dialogs. Empty by default; native fields (voltage/amperage/phase/supply, feed binding) are never listed here. |
-| `power_capacity_default_w` | `1000`        | Fallback rack power capacity (watts) used when no `dcim.PowerFeed` is modeled on the rack. Not present in `default_settings`; read via `get_plugin_config` with this default. |
-| `power_draw_basis`  | `"allocated"`        | Which PowerPort/PowerPortTemplate field to sum for projected draw: `"allocated"` or `"maximum"` (falls back to the other when the chosen one is unset). Not present in `default_settings`; read via `get_plugin_config` with this default. |
-| `power_warn_pct`    | `80`                 | Utilization percentage at/above which a rack's power state is "warn". Not present in `default_settings`; read via `get_plugin_config` with this default. |
-| `power_critical_pct`| `100`                | Utilization percentage at/above which a rack's power state is "critical". Not present in `default_settings`; read via `get_plugin_config` with this default. |
-| `power_exclude_roles` | `("pdu", "unmanageable-pdu")` | Device role slugs (case-insensitive) excluded from the power-consumption sum — power infrastructure, not consumers. Not present in `default_settings`; read via `get_plugin_config` with this default. |
-| `peer_conflicts_enabled` | `True` | Whether a design's projection reports conflicts with designs outside its own chain (peer designs planning the same unit, name, or device). A peer design's title is disclosed in these reports even past NetBox object permissions, since a conflict without a name to act on is not actionable; set to `False` to disable peer detection entirely if that disclosure is unacceptable. See [docs/peer-conflicts.md](docs/peer-conflicts.md). |
+| Key                        | Default                       | Description                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `planned_status`           | `"planned"`                   | The device status the plugin treats as "planned".                                                                                                                                                                                                                                                                                                                                                                                            |
+| `removal_status`           | `"decommissioning"`           | The device status that marks a planned removal. Override with a safe custom status where `decommissioning` is destructive (see note above).                                                                                                                                                                                                                                                                                                  |
+| `default_status`           | `"draft"`                     | Default lifecycle status for a new Design.                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `enable_rack_panel`        | `True`                        | Show the rack-page panel listing designs that touch a rack.                                                                                                                                                                                                                                                                                                                                                                                  |
+| `naming_mode`              | `"sequence"`                  | How a placement's proposed name is computed: `"sequence"` (`<design title>-<n>`), `"template"` (a `str.format` template over real model objects), or `"script"` (a dotted path to `fn(placement) -> str`). See [docs/device-naming.md](docs/device-naming.md).                                                                                                                                                                               |
+| `naming_template`          | `"{design.name}-{n}"`         | Template used when `naming_mode == "template"`. Dotted attribute paths on the real Design/Device objects; `{design.name}` aliases the design title.                                                                                                                                                                                                                                                                                          |
+| `naming_script`            | `""`                          | Dotted path to a callable used when `naming_mode == "script"`.                                                                                                                                                                                                                                                                                                                                                                               |
+| `naming`                   | `{}`                          | Reserved for future per-design naming options. No options are currently defined.                                                                                                                                                                                                                                                                                                                                                             |
+| `distribution_mode`        | `"none"`                      | How per-PDU/bank load is distributed for the power heatmap: `"none"` (per-rack total only, per-device gradient), `"builtin"` (native distribution from bank = outlet port name segment + feed-leg = bound feed, zero config), or `"script"` (a dotted path to `fn(rack, devices) -> Distribution` dict). See [docs/pdu-distribution-spec.md](docs/pdu-distribution-spec.md).                                                                 |
+| `distribution_script`      | `""`                          | Dotted path to a callable used when `distribution_mode == "script"`.                                                                                                                                                                                                                                                                                                                                                                         |
+| `planning_fields`          | `{}`                          | Custom-field bridge mapping site custom fields into the rack/PDU planning dialogs. Empty by default; native fields (voltage/amperage/phase/supply, feed binding) are never listed here.                                                                                                                                                                                                                                                      |
+| `power_capacity_default_w` | `1000`                        | Fallback rack power capacity (watts) used when no `dcim.PowerFeed` is modeled on the rack. Not present in `default_settings`; read via `get_plugin_config` with this default.                                                                                                                                                                                                                                                                |
+| `power_draw_basis`         | `"allocated"`                 | Which PowerPort/PowerPortTemplate field to sum for projected draw: `"allocated"` or `"maximum"` (falls back to the other when the chosen one is unset). Not present in `default_settings`; read via `get_plugin_config` with this default.                                                                                                                                                                                                   |
+| `power_warn_pct`           | `80`                          | Utilization percentage at/above which a rack's power state is "warn". Not present in `default_settings`; read via `get_plugin_config` with this default.                                                                                                                                                                                                                                                                                     |
+| `power_critical_pct`       | `100`                         | Utilization percentage at/above which a rack's power state is "critical". Not present in `default_settings`; read via `get_plugin_config` with this default.                                                                                                                                                                                                                                                                                 |
+| `power_exclude_roles`      | `("pdu", "unmanageable-pdu")` | Device role slugs (case-insensitive) excluded from the power-consumption sum — power infrastructure, not consumers. Not present in `default_settings`; read via `get_plugin_config` with this default.                                                                                                                                                                                                                                       |
+| `peer_conflicts_enabled`   | `True`                        | Whether a design's projection reports conflicts with designs outside its own chain (peer designs planning the same unit, name, or device). A peer design's title is disclosed in these reports even past NetBox object permissions, since a conflict without a name to act on is not actionable; set to `False` to disable peer detection entirely if that disclosure is unacceptable. See [docs/peer-conflicts.md](docs/peer-conflicts.md). |
 
 The `power_*` keys are not listed in the plugin's `default_settings` (they have no admin-facing default in `__init__.py`); they are still fully overridable via `PLUGINS_CONFIG`, resolved at read time by `netbox_rack_design/projection.py` with the defaults shown above.
 
@@ -199,7 +200,7 @@ The `power_*` keys are not listed in the plugin's `default_settings` (they have 
 
 **Delivered**
 
-- **Projected rack elevations (read-only)** — see how a design's racks *would* look once applied, with front/rear faces and full-depth devices rendered across both faces.
+- **Projected rack elevations (read-only)** — see how a design's racks _would_ look once applied, with front/rear faces and full-depth devices rendered across both faces.
 - **Interactive visual rack editor** — GridStack drag-and-drop adds/moves/removes across a **multi-rack workspace** and both rack faces, writing placements without mutating live devices. Includes a searchable device-type catalog palette, per-user favorite device types, and per-user rack visibility.
 - **Multi-rack designs** — a design carries an explicit, site-validated rack scope and a read-only elevation view spanning all of its racks.
 - **Naming convention engine** — auto-names planned devices via `naming_mode` = `"sequence"` / `"template"` / `"script"`, with graceful fallback when a template or script fails.
