@@ -100,6 +100,32 @@ Install from PyPI into the same environment as your NetBox installation:
 pip install netbox-rack-design
 ```
 
+### Installing from GitHub instead
+
+To track `main`, a specific branch/tag, a fork, or a commit that hasn't been released to
+PyPI yet, install directly from the git repository instead:
+
+```bash
+pip install git+https://github.com/ravenrs/netbox-rack-design.git
+```
+
+Pin a branch, tag, or commit by appending `@<ref>` to the URL, e.g.
+`git+https://github.com/ravenrs/netbox-rack-design.git@v0.33.0`, or point it at your own
+fork (`git+https://github.com/<you>/netbox-rack-design.git`). Note that this installs
+whatever is pushed to that ref on GitHub — local, uncommitted changes are not picked up.
+
+For active development against a local checkout, clone the repo and install it editable
+instead, so code changes take effect without reinstalling:
+
+```bash
+git clone https://github.com/ravenrs/netbox-rack-design.git
+pip install -e netbox-rack-design
+```
+
+Whichever install method you use, NetBox needs to be able to import the package from its
+own environment — run the `pip install` inside the same virtualenv (or container) NetBox
+itself runs in, not a separate one.
+
 For NetBox Docker, add `netbox-rack-design` to your `plugin_requirements.txt`. See the
 [netbox-docker plugin instructions](https://github.com/netbox-community/netbox-docker/wiki/Using-Netbox-Plugins).
 
